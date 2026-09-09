@@ -963,7 +963,9 @@ Do not put vault tokens or passwords in plugin command args. Use the vault vendo
 
 ## Snapshot Options
 
-The `snapshot` command supports filtering to reduce output size:
+Existing elements keep their refs across snapshots. Take a fresh snapshot after navigation.
+
+Use filters to reduce snapshot output:
 
 ```bash
 agent-browser snapshot                    # Full accessibility tree
