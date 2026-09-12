@@ -1303,12 +1303,18 @@ async fn seed_recording_outputs(
     Ok(())
 }
 
+pub struct InitialRecordingFrame {
+    pub image_data: Vec<u8>,
+    pub device_width: f64,
+    pub device_height: f64,
+}
+
 /// Drain Chrome independently from the encoder so FFmpeg cannot stall frame ACKs.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_recording_task(
     client: Arc<CdpClient>,
     capture_session: String,
-    initial_image: Vec<u8>,
+    initial_frame: InitialRecordingFrame,
     output_path: String,
     fps: u32,
     shared_count: Arc<AtomicU64>,
@@ -1351,16 +1357,16 @@ pub fn spawn_recording_task(
 
         // Chrome does not reliably emit an initial PNG screencast frame for a
         // static page. Seed both outputs before listening for later repaints.
-        let seeded = seed_recording_outputs(
-            &frame_tx,
-            contact_tx.as_ref(),
-            CapturedVideoFrame {
-                image_data: Arc::new(initial_image),
-                elapsed: Duration::ZERO,
-                captured_at: tokio::time::Instant::now(),
-            },
-        )
-        .await;
+        let frame = CapturedVideoFrame {
+            sequence: 0,
+            image_data: Arc::new(initial_frame.image_data),
+            elapsed: Duration::ZERO,
+            captured_at: tokio::time::Instant::now(),
+            timestamp: cursor_timestamp(),
+            device_width: initial_frame.device_width,
+            device_height: initial_frame.device_height,
+        };
+        let seeded = seed_recording_outputs(&frame_tx, contact_tx.as_ref(), frame).await;
         shared_captured.fetch_add(1, Ordering::Relaxed);
 
         let started = match seeded {
@@ -1455,7 +1461,7 @@ fn decode_frame_data(value: &Value) -> Option<Vec<u8>> {
 pub async fn capture_initial_image(
     client: &CdpClient,
     session_id: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<InitialRecordingFrame, String> {
     let result = client
         .send_command(
             "Page.captureScreenshot",
@@ -1464,8 +1470,17 @@ pub async fn capture_initial_image(
         )
         .await
         .map_err(|error| format!("Failed to capture initial recording frame: {error}"))?;
-    decode_frame_data(&result)
-        .ok_or_else(|| "Initial recording screenshot returned no image data".to_string())
+    let image_data = decode_frame_data(&result)
+        .ok_or_else(|| "Initial recording screenshot returned no image data".to_string())?;
+    let (width, height) =
+        image::ImageReader::with_format(std::io::Cursor::new(&image_data), image::ImageFormat::Png)
+            .into_dimensions()
+            .map_err(|error| format!("Invalid initial recording screenshot: {error}"))?;
+    Ok(InitialRecordingFrame {
+        image_data,
+        device_width: f64::from(width),
+        device_height: f64::from(height),
+    })
 }
 
 async fn collect_frames(
@@ -2065,9 +2080,13 @@ mod tests {
             &frame_tx,
             Some(&contact_tx),
             CapturedVideoFrame {
+                sequence: 0,
                 image_data: image_data.clone(),
                 elapsed: Duration::ZERO,
                 captured_at: tokio::time::Instant::now(),
+                timestamp: cursor_timestamp(),
+                device_width: 64.0,
+                device_height: 64.0,
             },
         )
         .await
@@ -2075,7 +2094,10 @@ mod tests {
 
         assert_eq!(frame_rx.recv().await.unwrap().image_data, image_data);
         drop(contact_tx);
-        let frames = collect_contact_frames(contact_rx, DEFAULT_CONTACT_SHEET_THRESHOLD).unwrap();
+        let cursor = Arc::new(Mutex::new(RecordingCursorHistory::default()));
+        let frames =
+            collect_contact_frames(contact_rx, DEFAULT_CONTACT_SHEET_THRESHOLD, false, &cursor)
+                .unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].elapsed_ms, 0);
         let dir = tempfile::tempdir().unwrap();
