@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -211,6 +212,25 @@ pub struct MouseState {
     pub x: f64,
     pub y: f64,
     pub buttons: i32,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotRevision {
+    revision: u64,
+    url: String,
+    options: String,
+    tree: String,
+    refs: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ScreenshotObservation {
+    revision: u64,
+    signature: String,
+    decoded_hash: u64,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -521,6 +541,9 @@ pub struct DaemonState {
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
     pub backend_type: BackendType,
     pub ref_map: RefMap,
+    /// Last delta snapshot per page session. Bounded to the currently tracked tabs.
+    snapshot_revisions: HashMap<String, SnapshotRevision>,
+    screenshot_observations: HashMap<(String, String), ScreenshotObservation>,
     pub domain_filter: Arc<RwLock<Option<DomainFilter>>>,
     pub event_tracker: EventTracker,
     pub session_name: Option<String>,
@@ -668,6 +691,8 @@ impl DaemonState {
             webdriver_backend: None,
             backend_type: BackendType::Cdp,
             ref_map: RefMap::new(),
+            snapshot_revisions: HashMap::new(),
+            screenshot_observations: HashMap::new(),
             domain_filter: Arc::new(RwLock::new(
                 env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
                     .ok()
@@ -4595,7 +4620,7 @@ async fn load_storage_state(state: &mut DaemonState, path: &Option<String>) -> R
 
 async fn rollback_failed_launch(state: &mut DaemonState) -> Result<(), String> {
     let close_result = close_current_browser(state).await;
-    state.ref_map.clear();
+    state.ref_map.invalidate_all_documents();
     close_result
 }
 
@@ -4857,7 +4882,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.effective_ca_cert = effective_ca_cert;
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
-    state.ref_map.clear();
+    state.ref_map.invalidate_all_documents();
     state.session_setup = SessionSetup::default();
 
     let has_cdp = cdp_url.is_some() || cdp_port.is_some();
@@ -5178,7 +5203,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             state.webmcp.clear_invocations();
-            state.ref_map.clear();
+            state.ref_map.invalidate_all_documents();
             wb.navigate(url).await?;
             let new_url = wb.get_url().await.unwrap_or_else(|_| url.to_string());
             let title = wb.get_title().await.unwrap_or_default();
@@ -5251,6 +5276,11 @@ async fn navigate_active_page(
     // Same-document navigation retains registered tools and pending calls.
     // Subscribe before navigating, then let the ordered frameNavigated and
     // toolsAdded events invalidate and repopulate state for a new document.
+    let page_session = state
+        .browser
+        .as_ref()
+        .and_then(|browser| browser.active_session_id().ok())
+        .map(ToString::to_string);
     let _ = enable_webmcp_events(state).await;
 
     // With one tab, every tracked iframe belongs to the page being replaced.
@@ -5264,7 +5294,11 @@ async fn navigate_active_page(
         state.iframe_sessions.clear();
     }
 
-    state.ref_map.clear();
+    if let Some(session_id) = page_session.as_deref() {
+        state.ref_map.invalidate_page(session_id);
+    } else {
+        state.ref_map.begin_snapshot();
+    }
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
@@ -5440,7 +5474,7 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
         server.shutdown();
     }
 
-    state.ref_map.clear();
+    state.ref_map.invalidate_all_documents();
     match save_result {
         Ok(Some(path)) => Ok(json!({
             "closed": true,
@@ -5490,7 +5524,8 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         urls: cmd.get("urls").and_then(|v| v.as_bool()).unwrap_or(false),
     };
 
-    state.ref_map.clear();
+    let previous_refs = state.ref_map.ref_ids();
+    state.ref_map.begin_snapshot();
     let tree = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
@@ -5515,7 +5550,252 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         })
         .collect();
 
-    Ok(json!({ "snapshot": tree, "origin": url, "refs": refs }))
+    let current_refs = state.ref_map.ref_ids();
+    let mut removed_refs = previous_refs
+        .difference(&current_refs)
+        .map(|ref_id| format!("@{}", ref_id))
+        .collect::<Vec<_>>();
+    removed_refs.sort_by_key(|ref_id| {
+        ref_id
+            .trim_start_matches("@e")
+            .parse::<usize>()
+            .unwrap_or(usize::MAX)
+    });
+
+    if !cmd.get("delta").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(
+            json!({ "snapshot": tree, "origin": url, "refs": refs, "removedRefs": removed_refs }),
+        );
+    }
+
+    let options_key = serde_json::to_string(&json!({
+        "selector": options.selector,
+        "interactive": options.interactive,
+        "compact": options.compact,
+        "depth": options.depth,
+        "urls": options.urls,
+    }))
+    .unwrap_or_default();
+    let previous = state.snapshot_revisions.get(&session_id).cloned();
+    let revision = previous.as_ref().map_or(1, |entry| entry.revision + 1);
+    let force_full = cmd.get("full").and_then(Value::as_bool).unwrap_or(false)
+        || previous
+            .as_ref()
+            .is_none_or(|entry| entry.url != url || entry.options != options_key);
+    let response = if force_full {
+        json!({
+            "snapshot": { "kind": "full", "revision": revision, "tree": tree, "refs": refs },
+            "origin": url,
+        })
+    } else {
+        snapshot_delta_response(previous.as_ref().unwrap(), revision, &tree, &refs, &url)
+    };
+
+    if state.snapshot_revisions.len() >= 32 && !state.snapshot_revisions.contains_key(&session_id) {
+        if let Some(oldest_key) = state
+            .snapshot_revisions
+            .iter()
+            .min_by_key(|(_, entry)| entry.revision)
+            .map(|(key, _)| key.clone())
+        {
+            state.snapshot_revisions.remove(&oldest_key);
+        }
+    }
+    state.snapshot_revisions.insert(
+        session_id,
+        SnapshotRevision {
+            revision,
+            url,
+            options: options_key,
+            tree,
+            refs,
+        },
+    );
+    Ok(response)
+}
+
+fn snapshot_delta_response(
+    previous: &SnapshotRevision,
+    revision: u64,
+    tree: &str,
+    refs: &serde_json::Map<String, Value>,
+    origin: &str,
+) -> Value {
+    if previous.tree == tree {
+        return json!({
+            "snapshot": { "kind": "unchanged", "baseRevision": previous.revision, "revision": revision },
+            "origin": origin,
+        });
+    }
+
+    let mut changes = Vec::new();
+    for (ref_id, old_node) in &previous.refs {
+        match refs.get(ref_id) {
+            None => changes.push(json!({ "op": "remove", "ref": format!("@{}", ref_id) })),
+            Some(new_node) => {
+                for field in ["role", "name"] {
+                    if old_node.get(field) != new_node.get(field) {
+                        changes.push(json!({
+                            "op": "replace",
+                            "ref": format!("@{}", ref_id),
+                            "field": field,
+                            "value": new_node.get(field).cloned().unwrap_or(Value::Null),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    for (ref_id, node) in refs {
+        if !previous.refs.contains_key(ref_id) {
+            changes.push(json!({ "op": "add", "ref": format!("@{}", ref_id), "node": node }));
+        }
+    }
+
+    // Ref metadata contains only role/name, so it cannot describe checkbox
+    // state, text, values, hierarchy, or ordering. Include an exact tree splice
+    // alongside ref operations so every accepted revision can be reconstructed.
+    let before_lines: Vec<&str> = previous.tree.split('\n').collect();
+    let after_lines: Vec<&str> = tree.split('\n').collect();
+    let prefix = before_lines
+        .iter()
+        .zip(&after_lines)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = before_lines[prefix..]
+        .iter()
+        .rev()
+        .zip(after_lines[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let tree_change = json!({
+        "startLine": prefix,
+        "deleteCount": before_lines.len() - prefix - suffix,
+        "lines": after_lines[prefix..after_lines.len() - suffix],
+    });
+    let delta = json!({
+        "kind": "delta",
+        "baseRevision": previous.revision,
+        "revision": revision,
+        "changes": changes,
+        "treeChange": tree_change,
+    });
+    let delta_size = serde_json::to_vec(&delta).map_or(usize::MAX, |bytes| bytes.len());
+    if delta_size >= tree.len().saturating_mul(7) / 10 {
+        json!({
+            "snapshot": { "kind": "full", "revision": revision, "tree": tree, "refs": refs },
+            "origin": origin,
+        })
+    } else {
+        json!({ "snapshot": delta, "origin": origin })
+    }
+}
+
+fn decode_screenshot_pixels(base64_data: &str) -> Result<(u32, u32, Vec<u8>, u64), String> {
+    let encoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data)
+        .map_err(|e| format!("Base64 decode error: {}", e))?;
+    let image = image::load_from_memory(&encoded)
+        .map_err(|e| format!("Failed to decode screenshot pixels: {}", e))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+    let mut hasher = DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    rgba.hash(&mut hasher);
+    Ok((width, height, rgba, hasher.finish()))
+}
+
+fn changed_pixel_ratio(
+    previous: &ScreenshotObservation,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> f64 {
+    if previous.width != width || previous.height != height || previous.rgba.len() != rgba.len() {
+        return 1.0;
+    }
+    if rgba.is_empty() {
+        return 0.0;
+    }
+    let changed = previous
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgba.as_chunks::<4>().0)
+        .filter(|(before, after)| before != after)
+        .count();
+    changed as f64 / (rgba.len() / 4) as f64
+}
+
+/// Compares decoded pixels with the last returned conditional screenshot.
+/// Suppressed captures retain that baseline so small changes can accumulate.
+/// Encoded image metadata therefore cannot create a false positive.
+fn observe_screenshot(
+    state: &mut DaemonState,
+    key: String,
+    signature: String,
+    base64_data: &str,
+    threshold: f64,
+    options: &ScreenshotOptions,
+) -> Result<Value, String> {
+    let (width, height, rgba, decoded_hash) = decode_screenshot_pixels(base64_data)?;
+    // Retain an independent baseline and revision when alternating capture
+    // scopes in one tab. The shared cap also bounds retained pixel buffers.
+    let key = (key, signature.clone());
+    // Evict stale tab history before admitting another capture scope so decoded
+    // image buffers remain bounded even during long multi-tab sessions.
+    if !state.screenshot_observations.contains_key(&key)
+        && state.screenshot_observations.len() >= 32
+    {
+        if let Some(eviction_key) = state.screenshot_observations.keys().next().cloned() {
+            state.screenshot_observations.remove(&eviction_key);
+        }
+    }
+    let previous = state.screenshot_observations.get(&key);
+    let revision = previous.map_or(1, |item| item.revision.saturating_add(1));
+    let pixel_change_ratio = match previous {
+        Some(item) if item.signature == signature && item.decoded_hash == decoded_hash => 0.0,
+        Some(item) if item.signature == signature => {
+            changed_pixel_ratio(item, width, height, &rgba)
+        }
+        _ => 1.0,
+    };
+    let changed = previous.is_none()
+        || previous.is_some_and(|item| item.signature != signature)
+        || pixel_change_ratio > threshold;
+
+    let path = if changed {
+        Some(screenshot::save_screenshot(base64_data, options)?)
+    } else {
+        None
+    };
+    if changed {
+        state.screenshot_observations.insert(
+            key,
+            ScreenshotObservation {
+                revision,
+                signature,
+                decoded_hash,
+                width,
+                height,
+                rgba,
+            },
+        );
+    } else if let Some(previous) = state.screenshot_observations.get_mut(&key) {
+        previous.revision = revision;
+    }
+    let mut response = json!({
+        "changed": changed,
+        "revision": revision,
+        "pixelChangeRatio": pixel_change_ratio,
+        "threshold": threshold
+    });
+    if let Some(path) = path {
+        response["path"] = json!(path);
+    }
+    Ok(response)
 }
 
 async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -5523,45 +5803,19 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .get("annotate")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-
-    if let Some(ref wb) = state.webdriver_backend {
-        if state.browser.is_none() {
-            if annotate {
-                return Err(
-                    "Annotated screenshots are not yet implemented on the WebDriver backend"
-                        .to_string(),
-                );
-            }
-
-            let base64_data = wb.screenshot().await?;
-            let path = cmd.get("path").and_then(|v| v.as_str());
-            if let Some(p) = path {
-                let bytes = base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &base64_data,
-                )
-                .map_err(|e| format!("Base64 decode error: {}", e))?;
-                std::fs::write(p, bytes)
-                    .map_err(|e| format!("Failed to write screenshot: {}", e))?;
-                return Ok(json!({ "path": p }));
-            }
-            let tmp = format!(
-                "/tmp/screenshot-{}.png",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0)
-            );
-            let bytes =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &base64_data)
-                    .map_err(|e| format!("Base64 decode error: {}", e))?;
-            std::fs::write(&tmp, bytes)
-                .map_err(|e| format!("Failed to write screenshot: {}", e))?;
-            return Ok(json!({ "path": tmp }));
-        }
-    }
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let if_changed = cmd
+        .get("ifChanged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let threshold = cmd.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let signature = format!(
+        "selector={:?};fullPage={};annotate={}",
+        cmd.get("selector").and_then(|v| v.as_str()),
+        cmd.get("fullPage")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        annotate
+    );
 
     let format = cmd
         .get("format")
@@ -5570,7 +5824,7 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .unwrap_or("png")
         .to_string();
 
-    let options = ScreenshotOptions {
+    let mut options = ScreenshotOptions {
         selector: cmd
             .get("selector")
             .and_then(|v| v.as_str())
@@ -5592,32 +5846,76 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
             .map(String::from),
     };
 
-    if annotate {
-        state.ref_map.clear();
-        let _ = snapshot::take_snapshot(
+    let (session_id, result) = if let Some(wb) = state
+        .webdriver_backend
+        .as_ref()
+        .filter(|_| state.browser.is_none())
+    {
+        if annotate {
+            return Err(
+                "Annotated screenshots are not yet implemented on the WebDriver backend"
+                    .to_string(),
+            );
+        }
+        options.path.get_or_insert_with(|| {
+            format!(
+                "/tmp/screenshot-{}.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            )
+        });
+        (
+            "webdriver-active".to_string(),
+            screenshot::ScreenshotResult {
+                base64: wb.screenshot().await?,
+                annotations: Vec::new(),
+            },
+        )
+    } else {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        let session_id = mgr.active_session_id()?.to_string();
+        if annotate {
+            state.ref_map.begin_snapshot();
+            let _ = snapshot::take_snapshot(
+                &mgr.client,
+                &session_id,
+                &SnapshotOptions {
+                    interactive: true,
+                    ..SnapshotOptions::default()
+                },
+                &mut state.ref_map,
+                state.active_frame_id.as_deref(),
+                &state.iframe_sessions,
+            )
+            .await?;
+        }
+
+        let result = screenshot::take_screenshot(
             &mgr.client,
             &session_id,
-            &SnapshotOptions {
-                interactive: true,
-                ..SnapshotOptions::default()
-            },
-            &mut state.ref_map,
-            state.active_frame_id.as_deref(),
+            &state.ref_map,
+            &options,
             &state.iframe_sessions,
         )
         .await?;
-    }
 
-    let result = screenshot::take_screenshot(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        &options,
-        &state.iframe_sessions,
-    )
-    .await?;
+        (session_id, result)
+    };
 
-    let mut response = json!({ "path": result.path });
+    let mut response = if if_changed {
+        observe_screenshot(
+            state,
+            session_id,
+            signature,
+            &result.base64,
+            threshold,
+            &options,
+        )?
+    } else {
+        json!({ "path": screenshot::save_screenshot(&result.base64, &options)? })
+    };
     if !result.annotations.is_empty() {
         response["annotations"] = serde_json::to_value(&result.annotations)
             .map_err(|e| format!("Failed to serialize annotations: {}", e))?;
@@ -5709,7 +6007,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         // `tab new`, so it must use the same pre-navigation setup path.
         let defer_url = defer_url_until_controls || session_setup_pending(state).await;
 
-        state.ref_map.clear();
+        state.ref_map.begin_snapshot();
         state.active_iframe_sessions.clear();
         state.active_frame_id = None;
         state.webmcp.clear_invocations();
@@ -6254,15 +6552,16 @@ async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
             wb.back().await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
+            state.ref_map.invalidate_all_documents();
             return Ok(json!({ "url": url }));
         }
     }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
     mgr.evaluate("history.back()", None).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    state.ref_map.invalidate_page(&session_id);
     Ok(json!({ "url": url }))
 }
 
@@ -6272,15 +6571,16 @@ async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
             wb.forward().await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
+            state.ref_map.invalidate_all_documents();
             return Ok(json!({ "url": url }));
         }
     }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
     mgr.evaluate("history.forward()", None).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    state.ref_map.invalidate_page(&session_id);
     Ok(json!({ "url": url }))
 }
 
@@ -6290,7 +6590,7 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
             wb.reload().await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
             let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
+            state.ref_map.invalidate_all_documents();
             return Ok(json!({ "url": url }));
         }
     }
@@ -6320,7 +6620,7 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
     .await;
 
     let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    state.ref_map.invalidate_page(&session_id);
     Ok(json!({ "url": url }))
 }
 
@@ -6748,9 +7048,10 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
         selector,
         ..SnapshotOptions::default()
     };
-    // Start from the same ref base as a normal baseline snapshot so unchanged lines align.
+    // Reuse the current document identities without committing a failed capture.
     // Build the replacement separately so a failed diff leaves the existing refs usable.
-    let mut current_ref_map = RefMap::new();
+    let mut current_ref_map = state.ref_map.clone();
+    current_ref_map.begin_snapshot();
     let current = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
@@ -6780,7 +7081,10 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
         None => String::new(),
     };
 
-    let result = diff::diff_snapshots(&baseline_text, &current);
+    let result = diff::diff_snapshots(
+        &diff::snapshot_comparison_text(&baseline_text),
+        &diff::snapshot_comparison_text(&current),
+    );
     state.ref_map = current_ref_map;
     Ok(json!({
         "diff": result.diff,
@@ -6810,16 +7114,17 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .unwrap_or(WaitUntil::Load);
 
     // Each navigation can replace the document, so invalidate refs before it starts.
-    state.ref_map.clear();
+    let first_session_id = mgr.active_session_id()?.to_string();
+    state.ref_map.invalidate_page(&first_session_id);
 
     // Navigate to URL1 and snapshot
     mgr.navigate(url1, wait_until).await?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let first_session_id = mgr.active_session_id()?.to_string();
     let options = SnapshotOptions::default();
-    let mut snap1_ref_map = RefMap::new();
+    let mut snap1_ref_map = state.ref_map.clone();
     let snap1 = snapshot::take_snapshot(
         &mgr.client,
-        &session_id,
+        &first_session_id,
         &options,
         &mut snap1_ref_map,
         None,
@@ -6828,12 +7133,13 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     .await?;
 
     // Navigate to URL2 and snapshot
-    state.ref_map.clear();
+    snap1_ref_map.invalidate_page(&first_session_id);
     mgr.navigate(url2, wait_until).await?;
-    let mut snap2_ref_map = RefMap::new();
+    let second_session_id = mgr.active_session_id()?.to_string();
+    let mut snap2_ref_map = snap1_ref_map;
     let snap2 = snapshot::take_snapshot(
         &mgr.client,
-        &session_id,
+        &second_session_id,
         &options,
         &mut snap2_ref_map,
         None,
@@ -6841,7 +7147,10 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     )
     .await?;
 
-    let result = diff::diff_text(&snap1, &snap2);
+    let result = diff::diff_text(
+        &diff::snapshot_comparison_text(&snap1),
+        &diff::snapshot_comparison_text(&snap2),
+    );
     state.ref_map = snap2_ref_map;
     Ok(json!({
         "diff": result,
@@ -7011,7 +7320,7 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     let defer_url =
         defer_url_until_controls || (url.is_some() && session_setup_pending(state).await);
 
-    state.ref_map.clear();
+    state.ref_map.begin_snapshot();
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
     state.webmcp.clear_invocations();
@@ -7070,7 +7379,7 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
     };
     // Clear only after the switch commits, so a failed switch does not strand
     // the user on the old tab with dead refs and frame scope.
-    state.ref_map.clear();
+    state.ref_map.begin_snapshot();
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
     state.webmcp.clear_invocations();
@@ -7128,7 +7437,7 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     };
     // Clear only after the close commits; a rejected close (last tab, bad
     // index) must not wipe the caller's refs and frame scope.
-    state.ref_map.clear();
+    state.ref_map.begin_snapshot();
     state.active_iframe_sessions.clear();
     state.webmcp.clear_invocations();
     state.active_frame_id = None;
@@ -10607,7 +10916,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .as_ref()
         .ok_or("Browser not launched")?
         .page_count();
-    state.ref_map.clear();
+    state.ref_map.begin_snapshot();
 
     Ok(json!({
         "tabId": super::browser::format_tab_id(tab_id),
@@ -13066,12 +13375,84 @@ mod tests {
         assert_eq!(state.input_mode, "smooth");
     }
 
+    #[test]
+    fn screenshot_alternating_scopes_keep_independent_baselines() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let data =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png.into_inner());
+        let mut state = DaemonState::new();
+        let scopes = [
+            "selector=#a;fullPage=false",
+            "selector=#b;fullPage=false",
+            "selector=None;fullPage=true",
+        ];
+        for pass in 0..2 {
+            for (index, scope) in scopes.iter().enumerate() {
+                let path = dir.path().join(format!("{pass}-{index}.png"));
+                let options = ScreenshotOptions {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    ..Default::default()
+                };
+                let result = observe_screenshot(
+                    &mut state,
+                    "tab".into(),
+                    scope.to_string(),
+                    &data,
+                    0.0,
+                    &options,
+                )
+                .unwrap();
+                assert_eq!(
+                    result["changed"],
+                    pass == 0,
+                    "scope {scope}, pass {pass}: {result}"
+                );
+                assert_eq!(result["revision"], pass + 1);
+                assert_eq!(
+                    path.exists(),
+                    pass == 0,
+                    "suppressed screenshots must not create a file"
+                );
+            }
+        }
+    }
+
     use super::super::cdp::types::{AXNode, AXValue};
     use super::*;
     use crate::test_utils::EnvGuard;
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn screenshot_pixel_ratio_counts_changed_pixels() {
+        let previous = ScreenshotObservation {
+            revision: 1,
+            signature: "viewport".to_string(),
+            decoded_hash: 0,
+            width: 2,
+            height: 1,
+            rgba: vec![0, 0, 0, 255, 255, 255, 255, 255],
+        };
+        let current = vec![0, 0, 0, 255, 255, 0, 255, 255];
+        assert_eq!(changed_pixel_ratio(&previous, 2, 1, &current), 0.5);
+    }
+
+    #[test]
+    fn screenshot_pixel_ratio_treats_dimension_change_as_full_change() {
+        let previous = ScreenshotObservation {
+            revision: 1,
+            signature: "viewport".to_string(),
+            decoded_hash: 0,
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 255],
+        };
+        assert_eq!(changed_pixel_ratio(&previous, 2, 1, &[0; 8]), 1.0);
+    }
 
     /// A binding-recovery failure must tear the connection down: the attach
     /// paths set `state.browser` before calling this, so returning the error
@@ -14894,6 +15275,93 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(interpolated_mouse_steps(10.0, 100, None, true), 7);
         assert_eq!(interpolated_mouse_steps(10.0, 100, None, false), 1);
         assert_eq!(interpolated_mouse_steps(10.0, 100, Some(3), true), 3);
+    }
+
+    #[test]
+    fn snapshot_delta_tree_splice_preserves_changes_missing_from_ref_metadata() {
+        let padding = "- button \"Unchanged\" [ref=e99]\n".repeat(40);
+        let before = format!("{padding}- button \"Save\" [ref=e1]\n- checkbox \"Agree\" [ref=e2]");
+        let after = format!(
+            "{padding}- button \"Saved\" [ref=e1]\n- checkbox \"Agree\" [ref=e2] [checked]"
+        );
+        let previous = SnapshotRevision {
+            revision: 1, url: "about:blank".into(), options: "{}".into(), tree: before.clone(),
+            refs: serde_json::from_value(json!({"e1": {"role": "button", "name": "Save"}, "e2": {"role": "checkbox", "name": "Agree"}})).unwrap(),
+        };
+        let mut refs = previous.refs.clone();
+        refs["e1"]["name"] = json!("Saved");
+        for current in [after, before.replace("[ref=e2]", "[ref=e2] [checked]")] {
+            let result = snapshot_delta_response(&previous, 2, &current, &refs, &previous.url);
+            assert_eq!(result["snapshot"]["kind"], "delta");
+            let patch = &result["snapshot"]["treeChange"];
+            let start = patch["startLine"].as_u64().unwrap() as usize;
+            let count = patch["deleteCount"].as_u64().unwrap() as usize;
+            let mut reconstructed: Vec<&str> = before.split('\n').collect();
+            reconstructed.splice(
+                start..start + count,
+                patch["lines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap()),
+            );
+            assert_eq!(reconstructed.join("\n"), current);
+        }
+    }
+
+    #[test]
+    fn test_snapshot_delta_unchanged_is_tiny() {
+        let previous = SnapshotRevision {
+            revision: 4,
+            url: "https://example.com".to_string(),
+            options: "{}".to_string(),
+            tree: "- button \"Save\" [ref=e1]".to_string(),
+            refs: serde_json::from_value(json!({"e1": {"role": "button", "name": "Save"}}))
+                .unwrap(),
+        };
+        let result =
+            snapshot_delta_response(&previous, 5, &previous.tree, &previous.refs, &previous.url);
+        assert_eq!(result["snapshot"]["kind"], "unchanged");
+        assert_eq!(result["snapshot"]["baseRevision"], 4);
+        assert!(result["snapshot"].get("tree").is_none());
+    }
+
+    #[test]
+    fn test_snapshot_delta_reports_replacements_and_removals() {
+        let previous = SnapshotRevision {
+            revision: 1,
+            url: "https://example.com".to_string(),
+            options: "{}".to_string(),
+            tree: format!("{}\nold", "x".repeat(1000)),
+            refs: serde_json::from_value(json!({
+                "e1": {"role": "button", "name": "Save"},
+                "e2": {"role": "alert", "name": "Old"}
+            }))
+            .unwrap(),
+        };
+        let refs = serde_json::from_value(json!({
+            "e1": {"role": "button", "name": "Saved"},
+            "e3": {"role": "status", "name": "Done"}
+        }))
+        .unwrap();
+        let result = snapshot_delta_response(
+            &previous,
+            2,
+            &format!("{}\nnew", "x".repeat(1000)),
+            &refs,
+            &previous.url,
+        );
+        assert_eq!(result["snapshot"]["kind"], "delta");
+        let changes = result["snapshot"]["changes"].as_array().unwrap();
+        assert!(changes
+            .iter()
+            .any(|change| change["op"] == "replace" && change["ref"] == "@e1"));
+        assert!(changes
+            .iter()
+            .any(|change| change["op"] == "remove" && change["ref"] == "@e2"));
+        assert!(changes
+            .iter()
+            .any(|change| change["op"] == "add" && change["ref"] == "@e3"));
     }
 
     #[test]

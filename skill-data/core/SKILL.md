@@ -31,7 +31,7 @@ agent-browser click @e3         # 3. Act on refs from the snapshot
 agent-browser snapshot -i       # 4. Re-snapshot after any page change
 ```
 
-Refs (`@e1`, `@e2`, ...) are assigned fresh on every snapshot. They become **stale the moment the page changes** — after clicks that navigate, form submits, dynamic re-renders, dialog opens. Always re-snapshot before your next ref interaction.
+Refs (`@e1`, `@e2`, ...) can be reused across snapshots. Take a fresh snapshot after navigation or to observe page changes.
 
 ## Always use your own session
 
@@ -96,7 +96,11 @@ agent-browser snapshot -i -c              # compact (no empty structural nodes)
 agent-browser snapshot -i -d 3            # cap depth at 3 levels
 agent-browser snapshot -s "#main"         # scope to a CSS selector
 agent-browser snapshot -i --json          # machine-readable output
+agent-browser snapshot -i --delta         # full state once, then compact changes
+agent-browser snapshot -i --delta --full  # force full state and refresh baseline
 ```
+
+Use `--delta` to reduce repeated output and `--full` to reset the baseline.
 
 Snapshot output looks like:
 
@@ -312,7 +316,11 @@ agent-browser screenshot                        # temp path, printed on stdout
 agent-browser screenshot page.png               # specific path
 agent-browser screenshot --full full.png        # full scroll height
 agent-browser screenshot --annotate map.png     # numbered labels + legend keyed to snapshot refs
+agent-browser screenshot --if-changed           # recommended: skip unchanged images to save tokens
+agent-browser screenshot --threshold 0.01       # ignore changes affecting at most 1% of pixels
 ```
+
+Prefer `--if-changed` for repeated captures: skipping unchanged images is the most token-efficient option. The first capture returns a path; later unchanged captures omit it. See [conditional screenshot responses](references/commands.md#screenshots-and-pdf) for JSON fields.
 
 Headless Chromium screenshots hide native scrollbars for consistent image output. Pass `--hide-scrollbars false` when launching to keep native scrollbars visible.
 
