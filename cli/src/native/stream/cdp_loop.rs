@@ -305,6 +305,11 @@ pub(super) async fn cdp_event_loop(
                             let new_vh = *viewport_height.lock().await;
                             let viewport_changed = new_vw != vw || new_vh != vh;
                             if client_changed || session_changed || viewport_changed {
+                                // The watch retains its latest value across CDP
+                                // restarts. Invalidate it before stopping so a
+                                // client cannot receive a frame from the old
+                                // tab or viewport while the new cast starts.
+                                frame_watch.send_replace(None);
                                 if supports_screencast {
                                     let _ = client_arc
                                         .send_command_no_params("Page.stopScreencast", session_id.as_deref())
@@ -452,6 +457,29 @@ pub(super) async fn cdp_event_loop(
                                                     "timestamp": frame_timestamp_ms(meta),
                                                 }
                                             });
+
+                                            // The session or viewport can change while the
+                                            // frame acknowledgement is in flight. Hold the
+                                            // shared state guards through publication so the
+                                            // corresponding setter cannot clear the cache and
+                                            // then have this old frame repopulate it.
+                                            let active_client = client_slot.read().await;
+                                            let same_client = active_client
+                                                .as_ref()
+                                                .is_some_and(|client| Arc::ptr_eq(client, &client_arc));
+                                            let active_session = cdp_session_id.read().await;
+                                            let active_vw = viewport_width.lock().await;
+                                            let active_vh = viewport_height.lock().await;
+                                            let frame_is_current = same_client
+                                                && session_matches(
+                                                    active_session.as_deref(),
+                                                    evt.session_id.as_deref(),
+                                                )
+                                                && *active_vw == vw
+                                                && *active_vh == vh;
+                                            if !frame_is_current {
+                                                continue;
+                                            }
                                             frame_watch.send_replace(Some(Arc::new(
                                                 super::StreamFrame {
                                                     seq: Some(seq),
@@ -917,6 +945,37 @@ mod tests {
         .expect("timed out waiting for CDP method");
     }
 
+    async fn publish_frame_and_wait(
+        harness: &mut LoopHarness,
+        session_id: &str,
+        screencast_session_id: i64,
+        data: &str,
+    ) {
+        harness
+            .events
+            .send(json!({
+                "method": "Page.screencastFrame",
+                "sessionId": session_id,
+                "params": {
+                    "sessionId": screencast_session_id,
+                    "data": data,
+                    "metadata": { "timestamp": 1.0 }
+                }
+            }))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), harness.frames.changed())
+            .await
+            .expect("timed out waiting for test frame")
+            .expect("frame watch should stay open");
+        let frame = harness
+            .frames
+            .borrow()
+            .clone()
+            .expect("test frame should be cached");
+        let payload: Value = serde_json::from_str(&frame.json).unwrap();
+        assert_eq!(payload["data"], data);
+    }
+
     /// Reading the float as an integer stamps every frame 0, so no client can
     /// measure frame age.
     #[test]
@@ -1142,6 +1201,7 @@ mod tests {
             mock_cdp_with_rebind_events("F-NEW", std::time::Duration::ZERO, 2).await;
         let mut harness = start_loop_with_client(Some("S-OLD"), client, events, methods).await;
         next_message_of_type(&mut harness.messages, "status").await;
+        publish_frame_and_wait(&mut harness, "S-OLD", 6, "previous-tab-frame").await;
 
         *harness.cdp_session_id.write().await = Some("S-NEW".to_string());
         harness.client_notify.notify_one();
@@ -1187,6 +1247,7 @@ mod tests {
             mock_cdp_with_rebind_events("F-MAIN", std::time::Duration::ZERO, 2).await;
         let mut harness = start_loop_with_client(Some("S-ACTIVE"), client, events, methods).await;
         next_message_of_type(&mut harness.messages, "status").await;
+        publish_frame_and_wait(&mut harness, "S-ACTIVE", 7, "previous-size-frame").await;
 
         *harness.viewport_width.lock().await = 800;
         harness.client_notify.notify_one();
