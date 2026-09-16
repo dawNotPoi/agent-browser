@@ -51,6 +51,8 @@ test('source fingerprints detect edits and renames', () => {
 test('snapshot uploads contain source and locks but no local credentials or build caches', async () => {
   const paths = (await sourceFiles()).map(f => f.path);
   assert(paths.some(p => p.endsWith('/cli/Cargo.lock')));
+  assert(paths.some(p => p.endsWith('/repo/evals/package.json')));
+  assert(paths.some(p => p.endsWith('/repo/evals/pnpm-lock.yaml')));
   assert(paths.some(p => p.endsWith('/tools/pnpm-lock.yaml')));
   assert(!paths.some(p => /\/(node_modules|target|results|\.git|\.claude|\.codex)\//.test(p)));
   assert(!paths.some(p => /\/\.env/.test(p)));

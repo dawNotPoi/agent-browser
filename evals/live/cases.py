@@ -87,6 +87,24 @@ def has_sequence(args, sequence):
     return any(args[i:i + len(sequence)] == sequence for i in range(len(args)))
 
 
+def command_targets_path(command, action, workspace, target):
+    args = command.get("args", [])
+    try:
+        action_index = args.index(action)
+    except ValueError:
+        return False
+    expected = (workspace / target).resolve()
+    for value in args[action_index + 1:]:
+        if value.startswith("-"):
+            continue
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        if candidate.resolve() == expected:
+            return True
+    return False
+
+
 def successful_command_spans(starts, finishes, actions):
     starts_by_id = {command.get("id"): command for command in starts if command.get("id")}
     spans = []
@@ -170,7 +188,9 @@ def grade(case, workspace, url, heading, commands, tool_calls, events, answer, c
     if case.id == "page-screenshot":
         dimensions = png_dimensions(workspace / "status.png")
         checks["valid_screenshot"] = bool(dimensions)
-        checks["screenshot_of_requested_page"] = any("screenshot" in c["args"] and c.get("observed_url") == url + "/status" for c in successful)
+        checks["screenshot_of_requested_page"] = any(
+            command_targets_path(c, "screenshot", workspace, "status.png")
+            and c.get("observed_url") == url + "/status" for c in successful)
         checks["correct_heading"] = heading in answer
         details["screenshot_dimensions"] = dimensions
     elif case.id == "form-submit":

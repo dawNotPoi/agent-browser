@@ -126,12 +126,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
-          cache: pnpm
-          cache-dependency-path: evals/pnpm-lock.yaml
 
-      - name: Install eval dependencies
-        run: pnpm --dir evals install --ignore-workspace --frozen-lockfile
-
+      # These checks use only the language standard libraries. The live runner's
+      # release-age-gated production dependencies are not needed here.
       - name: Test live eval grading
         run: pnpm --dir evals run test:live
 

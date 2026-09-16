@@ -21,8 +21,9 @@ export async function sourceFiles() {
     }
   }
   for (const path of ['cli/src', 'cli/cdp-protocol', 'cli/Cargo.toml', 'cli/Cargo.lock', 'cli/build.rs',
-    'README.md', 'skills/agent-browser/SKILL.md', 'skill-data', 'evals/sandbox/environment.json',
-    'evals/sandbox/bootstrap.py', 'evals/sandbox/tools/package.json', 'evals/sandbox/tools/pnpm-lock.yaml']) await visit(path);
+    'README.md', 'skills/agent-browser/SKILL.md', 'skill-data', 'evals/package.json', 'evals/pnpm-lock.yaml',
+    'evals/sandbox/environment.json', 'evals/sandbox/bootstrap.py', 'evals/sandbox/tools/package.json',
+    'evals/sandbox/tools/pnpm-lock.yaml']) await visit(path);
   return files;
 }
 

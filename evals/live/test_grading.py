@@ -1,13 +1,24 @@
 """Reject the false positives that motivated live, execution-based evals."""
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from live.cases import CASES, README, grade, prepare
 from live.runner import Terminal, claude_trace, codex_trace, comparison, read_provider_trace, trace_after_flush
+
+
+def write_test_png(path):
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+                     + chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\xff")) + chunk(b"IEND", b""))
 
 
 class LiveGradingTests(unittest.TestCase):
@@ -65,12 +76,24 @@ class LiveGradingTests(unittest.TestCase):
         self.assertFalse(self.assess("page-screenshot")["checks"]["valid_screenshot"])
 
     def test_header_without_pixel_data_is_not_a_screenshot(self):
-        import struct
-        import zlib
         header = b"IHDR" + struct.pack(">IIBBBBB", 10, 10, 8, 2, 0, 0, 0)
         raw = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + header + struct.pack(">I", zlib.crc32(header))
         (self.workspace / "status.png").write_bytes(raw)
         self.assertFalse(self.assess("page-screenshot")["checks"]["valid_screenshot"])
+
+    def test_screenshot_to_another_file_does_not_validate_requested_artifact(self):
+        write_test_png(self.workspace / "status.png")
+        commands = [{"event": "finish", "args": ["screenshot", "wrong-name.png"], "exit_code": 0,
+                     "observed_url": "http://127.0.0.1:1234/status", "time_ns": 20}]
+        result = self.assess("page-screenshot", commands=commands)
+        self.assertTrue(result["checks"]["valid_screenshot"])
+        self.assertFalse(result["checks"]["screenshot_of_requested_page"])
+
+    def test_relative_requested_screenshot_path_is_correlated(self):
+        write_test_png(self.workspace / "status.png")
+        commands = [{"event": "finish", "args": ["screenshot", "./status.png"], "exit_code": 0,
+                     "observed_url": "http://127.0.0.1:1234/status", "time_ns": 20}]
+        self.assertTrue(self.assess("page-screenshot", commands=commands)["checks"]["screenshot_of_requested_page"])
 
     def test_screenshot_from_wrong_page_fails(self):
         commands = [{"event": "finish", "args": ["screenshot", "status.png"], "exit_code": 0,
