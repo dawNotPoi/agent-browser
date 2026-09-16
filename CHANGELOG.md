@@ -1,8 +1,44 @@
 # agent-browser
 
-## 0.37.1
+## 0.38.0
 
 <!-- release:start -->
+### New Features
+
+- Added **conditional screenshots** with `screenshot --if-changed` to skip unchanged captures and `--threshold <0-1>` to tolerate small pixel differences. Screenshot history is scoped to each tab and capture mode, and unchanged captures omit the image path to save tokens (#1813)
+- Added **automatic snapshot deltas** with `snapshot --delta`, which returns a full baseline followed by an unchanged revision or compact structural changes. Use `--full` to refresh the baseline (#1811)
+- Added **persistent snapshot refs** for surviving DOM elements across same-document changes. Replaced elements and navigated pages or iframes invalidate their refs without recycling identifiers (#1812)
+- Added **human-like pointer movement** with session `--input-mode`, per-action `--human` for clicks and drags, and reproducible curved `mouse move` paths (#1810)
+- Added **recording presentation tools**: `--cursor` renders an animated pointer and click ripple, while `--contact-sheet` saves a timestamped PNG summary of visual changes (#1807, #1808)
+- Added **stateful auth vault login** with `auth login --no-navigate`, which fills an already prepared login page after verifying its origin against the credential URL (#1771)
+- Added **WebMCP catalog updates** to normal browser responses. Concise, content-bounded summaries appear on initial discovery and catalog changes, while full schemas remain opt-in (#1842)
+
+### Improvements
+
+- Improved **recording frame timing** by holding the latest Chrome frame between repaints so the output duration follows the requested frame rate (#1806)
+
+### Bug Fixes
+
+- Fixed **CDP transport recovery and shutdown** so malformed transport messages do not strand unrelated commands and failed initialization disconnects cleanly (#1739)
+- Fixed **dropdown label matching** to normalize whitespace, including non-breaking spaces, when selecting options by visible label (#1736)
+
+### Documentation
+
+- Clarified **reliable browser wait strategies** by recommending page-specific selectors, text, URLs, or JavaScript conditions and reserving `networkidle` for pages known to become quiet (#1834)
+
+### Contributors
+
+- @ctate
+- @Railly
+- @mauricioantolin
+- @mecampbellsoup
+- @evrenverse
+- @judegao
+- @petehunt
+<!-- release:end -->
+
+## 0.37.1
+
 ### Bug Fixes
 
 - Fixed **Windows headless Chrome desktop artifacts** by isolating owned headless Chrome on a private desktop and ensuring its process tree is cleaned up when the daemon exits or is forcibly terminated. Headed and externally connected browsers retain their existing desktop behavior (#1498, #1820)
@@ -10,7 +46,6 @@
 ### Contributors
 
 - @ctate
-<!-- release:end -->
 
 ## 0.37.0
 
