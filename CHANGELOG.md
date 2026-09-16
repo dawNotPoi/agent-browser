@@ -1,8 +1,24 @@
 # agent-browser
 
-## 0.38.0
+## 0.38.1
 
 <!-- release:start -->
+### Bug Fixes
+
+- Fixed **recording cursor and mouse movement timing** so cursor rendering stays synchronized with page content during drags and timed mouse moves (#1869)
+
+### Documentation
+
+- Added Vercel Labs product and project status badges to the README (#1868)
+
+### Contributors
+
+- @ctate
+- @Railly
+<!-- release:end -->
+
+## 0.38.0
+
 ### New Features
 
 - Added **conditional screenshots** with `screenshot --if-changed` to skip unchanged captures and `--threshold <0-1>` to tolerate small pixel differences. Screenshot history is scoped to each tab and capture mode, and unchanged captures omit the image path to save tokens (#1813)
@@ -35,7 +51,6 @@
 - @evrenverse
 - @judegao
 - @petehunt
-<!-- release:end -->
 
 ## 0.37.1
 
