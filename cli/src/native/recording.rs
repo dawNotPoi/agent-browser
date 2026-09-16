@@ -2289,6 +2289,10 @@ mod tests {
     #[test]
     fn test_recording_start_sets_cursor_and_contact_sheet_options() {
         let mut state = RecordingState::new();
+        let expected_contact_sheet_path = Path::new("/tmp")
+            .join("demo.contact-sheet.png")
+            .to_string_lossy()
+            .to_string();
         let result = recording_start(
             &mut state,
             "/tmp/demo.webm",
@@ -2305,9 +2309,9 @@ mod tests {
         assert_eq!(state.contact_sheet_threshold, 0.12);
         assert_eq!(
             state.contact_sheet_path.as_deref(),
-            Some("/tmp/demo.contact-sheet.png")
+            Some(expected_contact_sheet_path.as_str())
         );
-        assert_eq!(result["contactSheetPath"], "/tmp/demo.contact-sheet.png");
+        assert_eq!(result["contactSheetPath"], expected_contact_sheet_path);
     }
 
     #[test]
@@ -2315,7 +2319,9 @@ mod tests {
         assert_eq!(contact_sheet_path("demo.webm"), "demo.contact-sheet.png");
         assert_eq!(
             contact_sheet_path("artifacts/demo.capture.webm"),
-            "artifacts/demo.capture.contact-sheet.png"
+            Path::new("artifacts")
+                .join("demo.capture.contact-sheet.png")
+                .to_string_lossy()
         );
     }
 

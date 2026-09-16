@@ -7251,6 +7251,32 @@ async fn next_stream_url(
     }
 }
 
+async fn wait_for_stream_navigation_ready(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    loop {
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("stream navigation observer should become ready")
+            .expect("stream should stay open")
+            .expect("stream message should be valid");
+        if !message.is_text() {
+            continue;
+        }
+        let payload: Value =
+            serde_json::from_str(message.to_text().expect("message should be text"))
+                .expect("stream payload should be JSON");
+        if payload["type"] == "status"
+            && payload["connected"] == true
+            && payload["screencasting"] == true
+        {
+            return;
+        }
+    }
+}
+
 async fn expect_no_stream_url(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -7428,7 +7454,7 @@ async fn e2e_stream_url_tracks_active_main_frame_navigation_categories() {
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
         .await
         .expect("websocket client should connect to runtime stream");
-    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await;
+    wait_for_stream_navigation_ready(&mut ws).await;
 
     let resp = execute_command(
         &json!({

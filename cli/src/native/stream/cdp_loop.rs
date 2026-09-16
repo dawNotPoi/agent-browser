@@ -6,6 +6,7 @@ use futures_util::FutureExt;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
 use crate::native::cdp::client::CdpClient;
+use crate::native::cdp::types::CdpEvent;
 use crate::native::network;
 
 use super::timestamp_ms;
@@ -111,6 +112,10 @@ pub(super) async fn cdp_event_loop(
     recording: Arc<Mutex<bool>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    // CDP broadcasts are not replayed to new subscribers. Preserve the receiver
+    // while restarting a screencast on the same client so navigation events
+    // emitted during the restart remain queued for the rebound session.
+    let mut carried_event_rx: Option<(Arc<CdpClient>, broadcast::Receiver<CdpEvent>)> = None;
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -136,7 +141,12 @@ pub(super) async fn cdp_event_loop(
 
         if count > 0 {
             if let Some(ref client) = *guard {
-                let mut event_rx = client.subscribe();
+                let mut event_rx = match carried_event_rx.take() {
+                    Some((carried_client, receiver)) if Arc::ptr_eq(&carried_client, client) => {
+                        receiver
+                    }
+                    _ => client.subscribe(),
+                };
                 let client_arc = Arc::clone(client);
                 drop(guard);
 
@@ -197,6 +207,8 @@ pub(super) async fn cdp_event_loop(
 
                 loop {
                     tokio::select! {
+                        biased;
+
                         seeded_frame_id = &mut frame_tree_seed => {
                             seed_in_flight = false;
                             if active_main_frame_id.is_none() {
@@ -241,6 +253,45 @@ pub(super) async fn cdp_event_loop(
                                 let mut sc = screencasting.lock().await;
                                 *sc = false;
                                 return;
+                            }
+                        }
+                        _ = client_notify.notified() => {
+                            let count = *client_count.lock().await;
+                            let new_session_id = cdp_session_id.read().await.clone();
+                            if count == 0 {
+                                if supports_screencast {
+                                    let _ = client_arc
+                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                        .await;
+                                }
+                                let mut sc = screencasting.lock().await;
+                                *sc = false;
+                                break;
+                            }
+                            let client_changed = {
+                                let guard = client_slot.read().await;
+                                let same = guard
+                                    .as_ref()
+                                    .is_some_and(|c| Arc::ptr_eq(c, &client_arc));
+                                !same
+                            };
+                            let session_changed = new_session_id != session_id;
+                            let new_vw = *viewport_width.lock().await;
+                            let new_vh = *viewport_height.lock().await;
+                            let viewport_changed = new_vw != vw || new_vh != vh;
+                            if client_changed || session_changed || viewport_changed {
+                                if supports_screencast {
+                                    let _ = client_arc
+                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                        .await;
+                                }
+                                let mut sc = screencasting.lock().await;
+                                *sc = false;
+                                if !client_changed {
+                                    carried_event_rx = Some((Arc::clone(&client_arc), event_rx));
+                                }
+                                client_notify.notify_one();
+                                break;
                             }
                         }
                         event = event_rx.recv() => {
@@ -406,48 +457,14 @@ pub(super) async fn cdp_event_loop(
                                 Err(broadcast::error::RecvError::Closed) => break,
                             }
                         }
-                        _ = client_notify.notified() => {
-                            let count = *client_count.lock().await;
-                            let new_session_id = cdp_session_id.read().await.clone();
-                            if count == 0 {
-                                if supports_screencast {
-                                    let _ = client_arc
-                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                        .await;
-                                }
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
-                                break;
-                            }
-                            let client_changed = {
-                                let guard = client_slot.read().await;
-                                let same = guard
-                                    .as_ref()
-                                    .is_some_and(|c| Arc::ptr_eq(c, &client_arc));
-                                !same
-                            };
-                            let session_changed = new_session_id != session_id;
-                            let new_vw = *viewport_width.lock().await;
-                            let new_vh = *viewport_height.lock().await;
-                            let viewport_changed = new_vw != vw || new_vh != vh;
-                            if client_changed || session_changed || viewport_changed {
-                                if supports_screencast {
-                                    let _ = client_arc
-                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                        .await;
-                                }
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
-                                client_notify.notify_one();
-                                break;
-                            }
-                        }
                     }
                 }
             } else {
+                carried_event_rx = None;
                 drop(guard);
             }
         } else {
+            carried_event_rx = None;
             let was_screencasting = *screencasting.lock().await;
             if was_screencasting {
                 if let Some(ref client) = *guard {
@@ -525,6 +542,18 @@ mod tests {
         mpsc::UnboundedSender<Value>,
         Arc<Mutex<Vec<String>>>,
     ) {
+        mock_cdp_with_rebind_event(main_frame_id, seed_delay, false).await
+    }
+
+    async fn mock_cdp_with_rebind_event(
+        main_frame_id: &str,
+        seed_delay: std::time::Duration,
+        forward_event_on_next_stop: bool,
+    ) -> (
+        Arc<CdpClient>,
+        mpsc::UnboundedSender<Value>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
             "ws://127.0.0.1:{}/devtools/browser/mock",
@@ -536,6 +565,7 @@ mod tests {
         let frame_id = main_frame_id.to_string();
 
         tokio::spawn(async move {
+            let mut forward_event_on_next_stop = forward_event_on_next_stop;
             let (stream, _) = listener.accept().await.unwrap();
             let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let (mut tx, mut rx) = ws.split();
@@ -565,6 +595,17 @@ mod tests {
                                 }
                             }
                             json!({ "frameTree": { "frame": { "id": frame_id } } })
+                        } else if method == "Page.stopScreencast" && forward_event_on_next_stop {
+                            forward_event_on_next_stop = false;
+                            let event = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                event_rx.recv(),
+                            )
+                            .await
+                            .expect("test should inject an event while screencast stops")
+                            .expect("test event channel should stay open");
+                            tx.send(Message::Text(event.to_string())).await.unwrap();
+                            json!({})
                         } else {
                             json!({})
                         };
@@ -697,6 +738,7 @@ mod tests {
         messages: broadcast::Receiver<String>,
         last_tabs: Arc<RwLock<Vec<Value>>>,
         cdp_session_id: Arc<RwLock<Option<String>>>,
+        client_notify: Arc<tokio::sync::Notify>,
         shutdown: watch::Sender<bool>,
         task: tokio::task::JoinHandle<()>,
         methods: Arc<Mutex<Vec<String>>>,
@@ -761,6 +803,7 @@ mod tests {
             messages,
             last_tabs,
             cdp_session_id,
+            client_notify,
             shutdown,
             task,
             methods,
@@ -991,6 +1034,35 @@ mod tests {
             harness.last_tabs.read().await[1]["url"],
             "https://new.test/"
         );
+
+        stop_loop(harness).await;
+    }
+
+    #[tokio::test]
+    async fn test_same_document_navigation_survives_session_rebind() {
+        let (client, events, methods) =
+            mock_cdp_with_rebind_event("F-NEW", std::time::Duration::ZERO, true).await;
+        let mut harness = start_loop_with_client(Some("S-OLD"), client, events, methods).await;
+        next_message_of_type(&mut harness.messages, "status").await;
+
+        *harness.cdp_session_id.write().await = Some("S-NEW".to_string());
+        harness.client_notify.notify_one();
+        wait_for_method(&harness.methods, "Page.stopScreencast").await;
+        harness
+            .events
+            .send(json!({
+                "method": "Page.navigatedWithinDocument",
+                "sessionId": "S-NEW",
+                "params": {
+                    "frameId": "F-NEW",
+                    "url": "https://new.test/immediate",
+                    "navigationType": "historyApi"
+                }
+            }))
+            .unwrap();
+
+        let message = next_message_of_type(&mut harness.messages, "url").await;
+        assert_eq!(message["url"], "https://new.test/immediate");
 
         stop_loop(harness).await;
     }
