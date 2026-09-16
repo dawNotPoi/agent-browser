@@ -7,6 +7,8 @@ import subprocess
 import sys
 import zlib
 
+from .safe_python import check_normalize_url
+
 
 @dataclass(frozen=True)
 class Case:
@@ -136,7 +138,7 @@ def png_dimensions(path):
         return None
 
 
-def grade(case, workspace, url, heading, commands, tool_calls, events, answer, completed):
+def grade(case, workspace, url, heading, commands, tool_calls, events, answer, completed, execute_agent_code=False):
     starts = [c for c in commands if c.get("event") == "start"]
     finishes = [c for c in commands if c.get("event") == "finish"]
     successful = [c for c in finishes if c.get("exit_code") == 0]
@@ -167,15 +169,20 @@ def grade(case, workspace, url, heading, commands, tool_calls, events, answer, c
         readme = workspace / "README.md"
         checks["exact_edit"] = readme.is_file() and readme.read_text() == README.replace("Browser setup", "Browser configuration")
     elif case.id == "local-code-fix":
-        # Restore the oracle independently; changing the test cannot produce a pass.
-        (workspace / "test_url_utils.py").write_text(URL_TEST)
-        try:
-            result = subprocess.run([sys.executable, "-m", "unittest", "test_url_utils"], cwd=workspace,
-                                    capture_output=True, text=True, timeout=15)
-            checks["unit_tests_pass"] = result.returncode == 0
-            details["unit_test_output"] = result.stdout + result.stderr
-        except subprocess.TimeoutExpired:
-            checks["unit_tests_pass"] = False
-            details["unit_test_output"] = "Independent tests timed out after 15s"
+        if execute_agent_code:
+            # The independent oracle runs only inside the disposable eval VM.
+            (workspace / "test_url_utils.py").write_text(URL_TEST)
+            try:
+                result = subprocess.run([sys.executable, "-m", "unittest", "test_url_utils"], cwd=workspace,
+                                        capture_output=True, text=True, timeout=15)
+                checks["unit_tests_pass"] = result.returncode == 0
+                details["unit_test_output"] = result.stdout + result.stderr
+            except subprocess.TimeoutExpired:
+                checks["unit_tests_pass"] = False
+                details["unit_test_output"] = "Independent tests timed out after 15s"
+            details["code_grading_mode"] = "sandboxed-subprocess"
+        else:
+            checks["unit_tests_pass"], details["unit_test_output"] = check_normalize_url(workspace / "url_utils.py")
+            details["code_grading_mode"] = "restricted-ast"
     return {"passed": all(checks.values()), "checks": checks, "details": details,
             "browser_calls": len(starts), "failed_browser_calls": sum(c.get("exit_code") != 0 for c in finishes)}

@@ -16,10 +16,11 @@ class LiveGradingTests(unittest.TestCase):
         self.workspace = Path(self.temp.name)
         prepare(self.workspace)
 
-    def assess(self, case_id, commands=(), calls=(), events=(), answer="", completed=True):
+    def assess(self, case_id, commands=(), calls=(), events=(), answer="", completed=True,
+               execute_agent_code=False):
         case = next(c for c in CASES if c.id == case_id)
         return grade(case, self.workspace, "http://127.0.0.1:1234", "Shipping status abc", list(commands),
-                     list(calls), list(events), answer, completed)
+                     list(calls), list(events), answer, completed, execute_agent_code=execute_agent_code)
 
     def test_hypothetical_commands_do_not_pass(self):
         result = self.assess("page-screenshot", answer="agent-browser skills get core\nagent-browser open URL\nagent-browser screenshot status.png")
@@ -88,7 +89,49 @@ class LiveGradingTests(unittest.TestCase):
 
     def test_changing_test_oracle_does_not_pass_broken_code(self):
         (self.workspace / "test_url_utils.py").write_text("# no tests\n")
-        self.assertFalse(self.assess("local-code-fix")["checks"]["unit_tests_pass"])
+        self.assertFalse(self.assess("local-code-fix", execute_agent_code=True)["checks"]["unit_tests_pass"])
+
+    def test_local_grading_does_not_execute_agent_python(self):
+        marker = self.workspace / "payload-ran"
+        (self.workspace / "url_utils.py").write_text(f'''from pathlib import Path
+Path({str(marker)!r}).write_text("executed")
+
+def normalize_url(url):
+    return url.split("#", 1)[0]
+''')
+        result = self.assess("local-code-fix")
+        self.assertFalse(result["checks"]["unit_tests_pass"])
+        self.assertEqual(result["details"]["code_grading_mode"], "restricted-ast")
+        self.assertFalse(marker.exists())
+
+    def test_local_grading_accepts_common_safe_implementations(self):
+        implementations = [
+            'def normalize_url(url):\n    return url.split("#")[0]\n',
+            'def normalize_url(url):\n    return url.split("#", 1)[0]\n',
+            '''from urllib.parse import urlparse, urlunparse
+
+def normalize_url(url):
+    parts = urlparse(url)
+    return urlunparse(parts._replace(fragment=""))
+''',
+            '''from urllib.parse import urlsplit, urlunsplit
+
+def normalize_url(url):
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+''',
+        ]
+        for source in implementations:
+            with self.subTest(source=source):
+                (self.workspace / "url_utils.py").write_text(source)
+                result = self.assess("local-code-fix")
+                self.assertTrue(result["checks"]["unit_tests_pass"], result["details"])
+
+    def test_disposable_guest_still_runs_the_independent_oracle(self):
+        (self.workspace / "url_utils.py").write_text('def normalize_url(url):\n    return url.split("#", 1)[0]\n')
+        result = self.assess("local-code-fix", execute_agent_code=True)
+        self.assertTrue(result["checks"]["unit_tests_pass"])
+        self.assertEqual(result["details"]["code_grading_mode"], "sandboxed-subprocess")
 
     def test_both_transcripts_require_actual_completion_event(self):
         self.assertFalse(claude_trace([{"hook_event_name": "PreToolUse", "tool_name": "Write"}])["completed"])

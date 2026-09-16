@@ -58,7 +58,7 @@ Use repeated `--case` flags to select cases, `--timeout` for a per-case limit in
 - `page-screenshot`: visit a local page, save a real PNG, and report its unique heading. The grader validates image data and independently observes the screenshot's page URL.
 - `form-submit`: register a test user through a local form. The server verifies the submitted fields and the grader requires successful browser interaction.
 - `local-doc-edit`: edit browser-related prose in a README without activating the browser skill.
-- `local-code-fix`: fix local URL handling without activating the browser skill. The grader restores and runs an independent test oracle.
+- `local-code-fix`: fix local URL handling without activating the browser skill. The disposable Vercel guest restores and runs an independent test oracle.
 
 Browser cases require a successful `skills get core` before the first browser action starts. Hypothetical commands do not count. Failed commands and recovery remain visible. Negative cases reject CLI invocations and observed skill activation attempts, even when the edit succeeds. Missing native provider completion events fail closed.
 
@@ -68,7 +68,7 @@ These are behavioral acceptance checks. Model sampling, provider behavior, and m
 
 ## Local debugging
 
-`pnpm --dir evals run eval:local` runs the same cases on a POSIX host with Python 3.10+, tmux, Chrome, agent-browser, and the provider CLIs installed. It inherits local logins, skills, and permission policies. `--open-terminal` opens each interactive session in macOS Terminal. `--binary`, `--chrome`, `--skill`, and `--skills-dir` select local inputs. Personal skill collisions are reported through `observed_skill_sources` and `other_skill_source_loaded`. Local results are useful for debugging but do not have the isolation of the sandbox workflow.
+`pnpm --dir evals run eval:local` runs the same cases on a POSIX host with Python 3.10+, tmux, Chrome, agent-browser, and the provider CLIs installed. It inherits local logins, skills, and permission policies. The local code grader uses a restricted AST interpreter and never imports or executes agent-written Python; the disposable Vercel guest uses the full independent test oracle. `--open-terminal` opens each interactive session in macOS Terminal. `--binary`, `--chrome`, `--skill`, and `--skills-dir` select local inputs. Personal skill collisions are reported through `observed_skill_sources` and `other_skill_source_loaded`. Local results are useful for debugging but do not have the isolation of the sandbox workflow.
 
 ## Original prompt-based evals
 

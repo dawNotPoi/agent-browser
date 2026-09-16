@@ -112,6 +112,32 @@ jobs:
       - name: Test sandbox package
         run: pnpm --filter @agent-browser/sandbox test
 
+  eval-harness:
+    name: Eval Harness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: evals/pnpm-lock.yaml
+
+      - name: Install eval dependencies
+        run: pnpm --dir evals install --ignore-workspace --frozen-lockfile
+
+      - name: Test live eval grading
+        run: pnpm --dir evals run test:live
+
+      - name: Test sandbox orchestration
+        run: pnpm --dir evals run test:sandbox
+
   eve-package:
     name: Eve Package
     runs-on: ubuntu-latest

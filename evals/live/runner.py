@@ -397,9 +397,11 @@ def run_case(args, provider, mode, case, trial, folder):
                                    if row.get("type") == "system" and row.get("model")), args.claude_model)
         permission_modes = sorted({row["permission_mode"] for row in hook_events if row.get("permission_mode")})
         permission_denials = [row for row in stream_events if row.get("type") == "system" and row.get("subtype") == "permission_denied"]
+        sandboxed = os.environ.get("AGENT_BROWSER_EVAL_SANDBOX") == "1"
         assessment = grade(case, workspace, fixture.url, fixture.heading, commands, trace["tool_calls"],
-                           fixture.events, trace["answer"], trace["completed"] and not error)
-        if os.environ.get("AGENT_BROWSER_EVAL_SANDBOX") == "1" and case.browser:
+                           fixture.events, trace["answer"], trace["completed"] and not error,
+                           execute_agent_code=sandboxed)
+        if sandboxed and case.browser:
             launches = [p for c in commands for p in c.get("browser_processes", [])]
             assessment["checks"]["requested_browser_mode_observed"] = bool(launches) and all(
                 p["headed"] == (args.browser_mode == "headed") for p in launches)

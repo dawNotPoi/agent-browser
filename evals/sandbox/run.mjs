@@ -1,6 +1,6 @@
 import { Sandbox } from '@vercel/sandbox';
 import { credentials as projectCredentials, loadLocalEnv } from './auth.mjs';
-import { executeGuest } from './lifecycle.mjs';
+import { collectGuestArtifacts, executeGuest, finalizeTrialResult, stopSandbox } from './lifecycle.mjs';
 import { CHROMIUM_SYSTEM_DEPS } from '@agent-browser/sandbox/vercel';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
@@ -111,6 +111,7 @@ async function runTrial(auth, snapshot, row, folder, guest) {
     signal: abort.signal });
   let exitCode;
   let error;
+  let cleanupError;
   const provenance = { ...row, sandboxName: sandbox.name, snapshotId: snapshot.snapshotId,
     sourceHash: snapshot.sourceHash, runnerHash: fingerprint(guest), permissions: options.permissions,
     auth: 'oidc-credential-brokering', projectId: auth.projectId, teamId: auth.teamId };
@@ -133,21 +134,16 @@ async function runTrial(auth, snapshot, row, folder, guest) {
   } finally {
     // This finally also runs on failure/interrupt. No credentials or home profiles are archived.
     console.log('  Collecting trial artifacts.');
-    try {
-      const report = await sandbox.readFileToBuffer({ path: `${REMOTE}/results/results.json` });
-      if (report) await writeFile(resolve(folder, 'results.json'), report);
-      const archive = await sandbox.runCommand({ cmd: 'tar', args: ['-czf', `${REMOTE}/artifacts.tar.gz`,
-        '--ignore-failed-read', '-C', REMOTE, 'results', 'xvfb.log', 'environment.json', 'trial.json'], timeoutMs: 30_000 });
-      if (archive.exitCode !== 0) throw new Error(`Artifact archive exited with ${archive.exitCode}`);
-      if (!await sandbox.downloadFile({ path: `${REMOTE}/artifacts.tar.gz` }, { path: resolve(folder, 'artifacts.tar.gz') })) throw new Error('Artifact archive missing');
-    } catch (e) { error = `${error ? error + '; ' : ''}Artifact collection failed: ${e}`; }
-    finally { console.log('  Stopping sandbox.'); await sandbox.stop(); active = undefined; }
+    const cleanupErrors = await collectGuestArtifacts(sandbox, { folder, remote: REMOTE });
+    console.log('  Stopping sandbox.');
+    const stopError = await stopSandbox(sandbox);
+    if (stopError) cleanupErrors.push(`Sandbox stop failed: ${stopError}`);
+    active = undefined;
+    if (cleanupErrors.length) cleanupError = cleanupErrors.join('; ');
   }
   let result;
   try { result = JSON.parse(await readFile(resolve(folder, 'results.json'), 'utf8')).results[0]; } catch { /* Fail closed below. */ }
-  const final = { ...result, ...provenance, passed: Boolean(result?.passed && exitCode === 0 && !error),
-    error: error ?? result?.error ?? (exitCode === 0 ? null : `Guest exited with ${exitCode ?? 'unknown status'}`), exitCode };
-  if (!result) { final.error ??= 'Missing guest result'; final.passed = false; }
+  const final = finalizeTrialResult({ result, provenance, exitCode, executionError: error, cleanupError });
   await json(resolve(folder, 'result.json'), final);
   return final;
 }
@@ -180,7 +176,11 @@ async function main() {
       await json(resolve(output, 'results.json'), { results, comparisons: comparisons(results) });
     }
   } finally {
-    if (active) await active.stop();
+    if (active) {
+      const stopError = await stopSandbox(active);
+      active = undefined;
+      if (stopError) console.error(`Sandbox cleanup failed: ${stopError}`);
+    }
   }
   console.log(`\nPassed ${results.filter(r => r.passed).length}/${results.length}. Report: ${output}/results.json`);
   process.exitCode = abort.signal.aborted ? 130 : results.every(r => r.passed) ? 0 : 1;
