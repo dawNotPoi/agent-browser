@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -236,6 +236,120 @@ pub fn cursor_timestamp() -> f64 {
 
 pub type SharedRecordingCursor = Arc<Mutex<RecordingCursorHistory>>;
 
+const CURSOR_OVERLAY_SCRIPT: &str = include_str!("recording-cursor.js");
+
+/// Paint recording feedback with the page so drags share the same compositor
+/// frame. An isolated world and a closed shadow root keep it out of page scripts
+/// and styles; the host is inert and absent from accessibility snapshots.
+pub struct CursorOverlay {
+    script_id: String,
+    world_name: String,
+}
+
+pub type SharedCursorOverlays = Arc<tokio::sync::Mutex<HashMap<String, CursorOverlay>>>;
+
+pub async fn ensure_cursor_overlays(
+    client: &CdpClient,
+    overlays: &SharedCursorOverlays,
+    sessions: &[String],
+) -> Result<(), String> {
+    let mut installed = overlays.lock().await;
+    for session in sessions {
+        if !installed.contains_key(session) {
+            let overlay = CursorOverlay::install(client, session).await?;
+            installed.insert(session.clone(), overlay);
+        }
+    }
+    Ok(())
+}
+
+pub async fn remove_cursor_overlays(client: &CdpClient, overlays: &SharedCursorOverlays) {
+    let installed = std::mem::take(&mut *overlays.lock().await);
+    for (session, overlay) in installed {
+        let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, overlay.remove(client, &session)).await;
+    }
+}
+
+impl CursorOverlay {
+    async fn install(client: &CdpClient, session_id: &str) -> Result<Self, String> {
+        client
+            .send_command_no_params("Page.enable", Some(session_id))
+            .await?;
+        let world_name = format!("agent-browser-recording-{session_id}");
+        let result = client
+            .send_command(
+                "Page.addScriptToEvaluateOnNewDocument",
+                Some(json!({
+                    "source": CURSOR_OVERLAY_SCRIPT,
+                    "worldName": world_name,
+                    "runImmediately": true,
+                })),
+                Some(session_id),
+            )
+            .await?;
+        let script_id = result["identifier"]
+            .as_str()
+            .ok_or("Cursor script returned no identifier")?
+            .to_string();
+        Ok(Self {
+            script_id,
+            world_name,
+        })
+    }
+
+    async fn remove(&self, client: &CdpClient, session_id: &str) {
+        let _ = client
+            .send_command(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                Some(json!({
+                    "identifier": self.script_id,
+                })),
+                Some(session_id),
+            )
+            .await;
+        let Ok(tree) = client
+            .send_command_no_params("Page.getFrameTree", Some(session_id))
+            .await
+        else {
+            return;
+        };
+        let mut frames = vec![&tree["frameTree"]];
+        while let Some(frame) = frames.pop() {
+            if let Some(children) = frame["childFrames"].as_array() {
+                frames.extend(children);
+            }
+            let Some(id) = frame["frame"]["id"].as_str() else {
+                continue;
+            };
+            let Ok(context) = client
+                .send_command(
+                    "Page.createIsolatedWorld",
+                    Some(json!({
+                        "frameId": id, "worldName": self.world_name,
+                    })),
+                    Some(session_id),
+                )
+                .await
+            else {
+                continue;
+            };
+            let Some(context_id) = context["executionContextId"].as_i64() else {
+                continue;
+            };
+            let _ = client
+                .send_command(
+                    "Runtime.evaluate",
+                    Some(json!({
+                        "contextId": context_id,
+                        "expression": "globalThis.__agentBrowserRecordingCursorCleanup?.()",
+                    })),
+                    Some(session_id),
+                )
+                .await;
+        }
+    }
+}
+
 const CURSOR_PATH: [(f64, f64); 4] = [(0.0, 0.0), (14.0, 8.5), (7.5, 10.0), (4.0, 16.0)];
 const CURSOR_BASE_SCALE: f64 = 28.0 / 24.0;
 const CURSOR_PRESS_SCALE: f64 = 0.8;
@@ -420,8 +534,10 @@ pub struct RecordingState {
     pub capture_session: SharedCaptureSession,
     /// Whether the encoded video includes a synthetic pointer.
     pub cursor: bool,
-    /// Pointer state composited onto encoded frames after contact-sheet analysis.
+    /// Last acknowledged input, including coordinates mapped out of iframes.
     pub shared_cursor: SharedRecordingCursor,
+    /// Per-target cursor overlays, including out-of-process iframes.
+    pub cursor_overlays: SharedCursorOverlays,
     /// Whether the capture task exports selected frames as a PNG sheet.
     pub contact_sheet: bool,
     pub contact_sheet_threshold: f64,
@@ -445,6 +561,7 @@ impl RecordingState {
             capture_session: Arc::new(Mutex::new(None)),
             cursor: false,
             shared_cursor: Arc::new(Mutex::new(RecordingCursorHistory::default())),
+            cursor_overlays: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             contact_sheet: false,
             contact_sheet_threshold: DEFAULT_CONTACT_SHEET_THRESHOLD,
             contact_sheet_path: None,
@@ -1321,6 +1438,8 @@ pub fn spawn_recording_task(
     shared_captured: Arc<AtomicU64>,
     cursor: bool,
     shared_cursor: SharedRecordingCursor,
+    cursor_overlays: SharedCursorOverlays,
+    iframe_sessions: Vec<String>,
     contact_sheet_path: Option<String>,
     contact_sheet_threshold: f64,
     shared_contact_sheet_count: Arc<AtomicU64>,
@@ -1328,6 +1447,15 @@ pub fn spawn_recording_task(
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         let fps = validate_fps(fps)?;
+        if cursor {
+            let mut sessions = iframe_sessions;
+            sessions.push(capture_session.clone());
+            if let Err(error) = ensure_cursor_overlays(&client, &cursor_overlays, &sessions).await {
+                remove_cursor_overlays(&client, &cursor_overlays).await;
+                detach_capture_session(&client, &capture_session).await;
+                return Err(format!("Failed to install recording cursor: {error}"));
+            }
+        }
         let events = client.subscribe_session(&capture_session);
         let (frame_tx, frame_rx) = mpsc::channel(ENCODER_FRAME_BUFFER);
         let (contact_tx, mut contact_worker) = if let Some(path) = contact_sheet_path.as_ref() {
@@ -1336,7 +1464,7 @@ pub fn spawn_recording_task(
             let path = path.clone();
             let worker = tokio::task::spawn_blocking(move || {
                 let frames =
-                    collect_contact_frames(rx, contact_sheet_threshold, cursor, &contact_cursor)?;
+                    collect_contact_frames(rx, contact_sheet_threshold, false, &contact_cursor)?;
                 write_contact_sheet(Path::new(&path), &frames)?;
                 Ok::<u64, String>(frames.len() as u64)
             });
@@ -1350,7 +1478,7 @@ pub fn spawn_recording_task(
         let encoder = tokio::spawn(encode_stream(
             output_path,
             fps,
-            cursor,
+            false,
             shared_cursor.clone(),
             frame_rx,
         ));
@@ -1408,6 +1536,7 @@ pub fn spawn_recording_task(
             client.send_command_no_params("Page.stopScreencast", Some(&capture_session)),
         )
         .await;
+        remove_cursor_overlays(&client, &cursor_overlays).await;
         detach_capture_session(&client, &capture_session).await;
 
         if let Err(error) = captured {

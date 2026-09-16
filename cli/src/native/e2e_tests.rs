@@ -8953,6 +8953,140 @@ async fn e2e_recording_cursor_and_contact_sheet() {
     assert_success(&resp);
 }
 
+/// The cursor must not intercept clicks, leak into snapshots, or survive stop.
+#[tokio::test]
+#[ignore]
+async fn e2e_recording_cursor_overlay_lifecycle() {
+    let mut state = DaemonState::new();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cursor-lifecycle.mp4");
+    let url =
+        "data:text/html,<button id=keep onclick='window.clicks=(window.clicks||0)+1'>Keep</button>";
+    for command in [
+        json!({"action":"launch","headless":true}),
+        json!({"action":"navigate","url":url}),
+        json!({"action":"recording_start","path":path,"cursor":true}),
+        json!({"action":"click","selector":"#keep"}),
+    ] {
+        assert_success(&execute_command(&command, &mut state).await);
+    }
+    let inspected = execute_command(&json!({"action":"evaluate","script":"(() => { const host = document.querySelector('[data-agent-browser-recording-cursor]'); return !!host && host.inert && host.getAttribute('aria-hidden') === 'true' && host.shadowRoot === null && typeof globalThis.__agentBrowserRecordingCursorCleanup === 'undefined' && window.clicks === 1; })()"}), &mut state).await;
+    assert_success(&inspected);
+    assert_eq!(get_data(&inspected)["result"], true);
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    assert!(!get_data(&snapshot)
+        .to_string()
+        .contains("agent-browser-recording-cursor"));
+    assert_success(
+        &execute_command(
+            &json!({"action":"navigate","url":"data:text/html,<button>After navigation</button>"}),
+            &mut state,
+        )
+        .await,
+    );
+    let after_navigation = execute_command(&json!({"action":"evaluate","script":"document.querySelectorAll('[data-agent-browser-recording-cursor]').length"}), &mut state).await;
+    let stopped = execute_command(&json!({"action":"recording_stop"}), &mut state).await;
+    let after_stop = execute_command(&json!({"action":"evaluate","script":"document.querySelectorAll('[data-agent-browser-recording-cursor]').length"}), &mut state).await;
+    assert_success(&execute_command(&json!({"action":"navigate","url":url}), &mut state).await);
+    let after_next_navigation = execute_command(&json!({"action":"evaluate","script":"document.querySelectorAll('[data-agent-browser-recording-cursor]').length"}), &mut state).await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    assert_success(&stopped);
+    assert_eq!(get_data(&after_navigation)["result"], 1);
+    assert_eq!(get_data(&after_stop)["result"], 0);
+    assert_eq!(get_data(&after_next_navigation)["result"], 0);
+}
+
+/// Check every encoded frame while a real page control follows drag input.
+#[tokio::test]
+#[ignore]
+async fn e2e_recording_cursor_stays_aligned_during_drag() {
+    let mut state = DaemonState::new();
+    for command in [
+        json!({ "action": "launch", "headless": true }),
+        json!({ "action": "viewport", "width": 640, "height": 480 }),
+        json!({
+            "action": "navigate",
+            "url": "data:text/html,<style>body{margin:0;background:%23303030}div{position:fixed;left:80px;top:0;width:2px;height:100vh;background:%2300ff00}</style><div></div><script>document.addEventListener('pointermove',e=>{if(e.buttons)document.querySelector('div').style.left=e.clientX+'px'})</script>"
+        }),
+        json!({ "action": "mousemove", "x": 80, "y": 240 }),
+    ] {
+        assert_success(&execute_command(&command, &mut state).await);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("drag-cursor.mp4");
+    assert_success(
+        &execute_command(
+            &json!({ "action": "recording_start", "path": path, "cursor": true, "fps": 60 }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&execute_command(&json!({ "action": "mousedown" }), &mut state).await);
+    for x in [560, 80, 560] {
+        assert_success(
+            &execute_command(
+                &json!({ "action": "mousemove", "x": x, "y": 240, "duration": 1000, "inputMode": "human", "seed": 42 }),
+                &mut state,
+            )
+            .await,
+        );
+    }
+    assert_success(&execute_command(&json!({ "action": "mouseup" }), &mut state).await);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_success(&execute_command(&json!({ "action": "recording_stop" }), &mut state).await);
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args([
+            "-vf",
+            "crop=640:80:0:200",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let mut measured = 0;
+    let mut worst = 0;
+    let mut positions = std::collections::HashSet::new();
+    for bytes in output.stdout.chunks_exact(640 * 80 * 3) {
+        let frame = image::RgbImage::from_raw(640, 80, bytes.to_vec()).unwrap();
+        let line = (0..640).find(|&x| {
+            let [r, g, b] = frame.get_pixel(x, 0).0;
+            g > 150 && g > r.saturating_add(60) && g > b.saturating_add(60)
+        });
+        let cursor = frame
+            .enumerate_pixels()
+            .filter_map(|(x, _, pixel)| {
+                let [r, g, b] = pixel.0;
+                (r > 180 && g > 180 && b > 180).then_some(x)
+            })
+            .min();
+        if let (Some(line), Some(cursor)) = (line, cursor) {
+            measured += 1;
+            positions.insert(line);
+            worst = worst.max(line.abs_diff(cursor));
+        }
+    }
+    assert!(measured >= 100, "only {measured} drag frames measured");
+    assert!(
+        positions.len() >= 60,
+        "drag must exercise moving page frames"
+    );
+    // The cursor's white fill starts 1-2 pixels inside its black outline.
+    assert!(
+        worst <= 3,
+        "recorded cursor separated from the dragged control by {worst} pixels"
+    );
+}
+
 /// A completed drag must not pin the recorded cursor to a stale page frame.
 #[tokio::test]
 #[ignore]
@@ -11081,8 +11215,7 @@ async fn e2e_recording_cursor_uses_page_coordinates_for_oopif() {
         .unwrap()
         .0
         .clone();
-    // Initialize cursor history without an encoder; the test inspects the exact
-    // samples consumed by both video and contact-sheet compositing.
+    // Verify the input samples retain top-level coordinates for frame actions.
     super::recording::recording_start(
         &mut state.recording_state,
         "unused.webm",
@@ -11109,8 +11242,56 @@ async fn e2e_recording_cursor_uses_page_coordinates_for_oopif() {
         assert!((state.mouse_state.y - cursor.y).abs() < 1.0);
     }
     state.recording_state.active = false;
+    state.browser.as_ref().unwrap().client.send_command("Runtime.evaluate", Some(json!({
+        "expression": "document.body.style.background='#303030'; const button = document.querySelector('button'); button.style.background='#303030'; button.style.border='0'; button.textContent=''"
+    })), Some(&child_session)).await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("iframe-cursor.mp4");
+    assert_success(
+        &execute_command(
+            &json!({"action":"recording_start", "path":path,"cursor":true,"fps":60}),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_success(
+        &execute_command(
+            &json!({"action":"hover", "selector":format!("@{reference}"), "inputMode":"human"}),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let stopped = execute_command(&json!({"action":"recording_stop"}), &mut state).await;
     assert_success(&execute_command(&json!({"action": "close"}), &mut state).await);
     server.abort();
+    assert_success(&stopped);
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-sseof", "-0.1", "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "png",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let image = image::load_from_memory(&output.stdout).unwrap().to_rgb8();
+    assert!(
+        image
+            .get_pixel(314, 224)
+            .0
+            .iter()
+            .all(|channel| *channel > 180),
+        "the cursor should be visible inside the out-of-process iframe"
+    );
 }
 
 #[tokio::test]

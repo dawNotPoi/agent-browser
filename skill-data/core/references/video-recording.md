@@ -92,7 +92,7 @@ The video uses the requested frame rate and holds the latest Chrome frame betwee
 
 ## Visible Cursor
 
-Chrome's screencast does not include the native pointer. Pass `--cursor` to add an animated pointer and click ripple. During a drag, the pointer follows the captured page frame. Releasing the mouse button resumes free pointer movement immediately, even when the page does not repaint.
+Chrome's screencast does not include the native pointer. Pass `--cursor` to add an animated pointer and click ripple rendered with the page, keeping drags synchronized in every captured frame. The temporary overlay is inert, hidden from accessibility snapshots, and removed when recording stops. Screenshots taken during the recording include it.
 
 ```bash
 agent-browser record start ./walkthrough.webm --cursor

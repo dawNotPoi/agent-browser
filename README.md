@@ -461,7 +461,7 @@ agent-browser state clear --all       # Clear all saved states
 agent-browser state clean --older-than <days>  # Delete old states
 ```
 
-With recording `--cursor`, the pointer stays aligned with captured page frames during a drag and resumes free movement as soon as the mouse button is released, even when the page does not repaint.
+With recording `--cursor`, the pointer and click ripple render with the page, keeping drags synchronized in every captured frame. The temporary overlay is inert, hidden from accessibility snapshots, and removed when recording stops. Screenshots taken during the recording include it.
 
 ### Navigation
 

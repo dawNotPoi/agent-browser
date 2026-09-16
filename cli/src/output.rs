@@ -2938,8 +2938,9 @@ Recording captures 30 fps, which keeps scrolls and CSS transitions smooth.
 Raise it to 60 for short, motion-heavy takes (drag interactions, animation
 work); lower it for long sessions where file size matters more than motion.
 
-With --cursor, the pointer follows captured page frames during a drag.
-Mouse release resumes free movement immediately, even on a static page.
+With --cursor, an inert overlay renders the pointer and page together so
+drags stay synchronized. It is hidden from accessibility snapshots and
+removed on stop. Screenshots taken while recording include the overlay.
 
 Operations:
   start <path> [url]     Start recording the active page (navigates first if url given)

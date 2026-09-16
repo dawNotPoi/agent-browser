@@ -1138,6 +1138,24 @@ impl DaemonState {
         let shared_captured = Arc::new(AtomicU64::new(0));
         let shared_contact_sheet_count = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        if self.recording_state.cursor {
+            self.refresh_active_iframe_sessions().await;
+            let mut sessions: Vec<_> = self.active_iframe_sessions.iter().cloned().collect();
+            sessions.push(capture_session.clone());
+            if let Err(error) = recording::ensure_cursor_overlays(
+                &client,
+                &self.recording_state.cursor_overlays,
+                &sessions,
+            )
+            .await
+            {
+                recording::remove_cursor_overlays(&client, &self.recording_state.cursor_overlays)
+                    .await;
+                recording::detach_capture_session(&client, &capture_session).await;
+                self.rollback_failed_recording_start().await;
+                return Err(format!("Failed to install recording cursor: {error}"));
+            }
+        }
         let handle = recording::spawn_recording_task(
             client,
             capture_session,
@@ -1148,6 +1166,8 @@ impl DaemonState {
             shared_captured.clone(),
             self.recording_state.cursor,
             self.recording_state.shared_cursor.clone(),
+            self.recording_state.cursor_overlays.clone(),
+            self.active_iframe_sessions.iter().cloned().collect(),
             self.recording_state.contact_sheet_path.clone(),
             self.recording_state.contact_sheet_threshold,
             shared_contact_sheet_count.clone(),
@@ -1552,6 +1572,30 @@ impl DaemonState {
 
         if active_frame_scope_changed {
             self.refresh_active_iframe_sessions().await;
+            if self.recording_state.active && self.recording_state.cursor {
+                let capture = self
+                    .recording_state
+                    .capture_session
+                    .lock()
+                    .ok()
+                    .and_then(|capture| capture.as_ref().and_then(|c| c.session_id.clone()));
+                if let (Some(browser), Some(capture)) = (self.browser.as_ref(), capture) {
+                    if let Ok(sessions) = a11y::active_iframe_session_ids(
+                        &browser.client,
+                        &capture,
+                        &self.iframe_sessions,
+                    )
+                    .await
+                    {
+                        let _ = recording::ensure_cursor_overlays(
+                            &browser.client,
+                            &self.recording_state.cursor_overlays,
+                            &sessions.into_iter().collect::<Vec<_>>(),
+                        )
+                        .await;
+                    }
+                }
+            }
         }
 
         Ok(())
