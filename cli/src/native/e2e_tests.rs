@@ -8953,6 +8953,108 @@ async fn e2e_recording_cursor_and_contact_sheet() {
     assert_success(&resp);
 }
 
+/// A completed drag must not pin the recorded cursor to a stale page frame.
+#[tokio::test]
+#[ignore]
+async fn e2e_recording_cursor_moves_after_release_without_repaint() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "action": "viewport", "width": 640, "height": 480 }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({
+                "action": "navigate",
+                "url": "data:text/html,<style>body{margin:0;background:%23202020}</style>"
+            }),
+            &mut state,
+        )
+        .await,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("released-cursor.mp4");
+    assert_success(
+        &execute_command(
+            &json!({ "action": "recording_start", "path": path, "cursor": true, "fps": 60 }),
+            &mut state,
+        )
+        .await,
+    );
+    for command in [
+        json!({ "action": "mousemove", "x": 80, "y": 80 }),
+        json!({ "action": "mousedown" }),
+        json!({ "action": "mousemove", "x": 120, "y": 100, "duration": 150, "inputMode": "human" }),
+    ] {
+        assert_success(&execute_command(&command, &mut state).await);
+    }
+    let captured = state
+        .recording_state
+        .shared_captured_count
+        .as_ref()
+        .unwrap()
+        .clone();
+    let before = captured.load(Ordering::Relaxed);
+    // Paint while pressed, then leave the page completely static after release.
+    assert_success(
+        &execute_command(
+            &json!({ "action": "evaluate", "script": "document.body.style.background = '#303030'" }),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while captured.load(Ordering::Relaxed) == before {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the pressed page frame should reach the recorder");
+    for command in [
+        json!({ "action": "mouseup" }),
+        json!({ "action": "mousemove", "x": 240, "y": 180, "duration": 250, "inputMode": "human" }),
+    ] {
+        assert_success(&execute_command(&command, &mut state).await);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_success(&execute_command(&json!({ "action": "recording_stop" }), &mut state).await);
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-sseof", "-0.1", "-i"])
+        .arg(&path)
+        .args([
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "png",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let frame = image::load_from_memory(&output.stdout).unwrap().to_rgb8();
+    assert_eq!(frame.dimensions(), (640, 480));
+    assert!(
+        frame.get_pixel(244, 184).0.iter().all(|value| *value > 180),
+        "the released cursor should reach the new position in the encoded video; got {:?}",
+        frame.get_pixel(244, 184).0
+    );
+    assert!(
+        frame.get_pixel(124, 104).0.iter().all(|value| *value < 80),
+        "the old drag position should contain only the page background"
+    );
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_initial_recording_frame_uses_css_viewport_dimensions() {

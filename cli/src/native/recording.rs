@@ -1791,6 +1791,8 @@ fn scaled_cursor(
     )
 }
 
+/// Anchor an active drag to the page capture, but let button transitions and
+/// released movement render immediately even when the page does not repaint.
 fn cursor_for_video_frame(
     history: &RecordingCursorHistory,
     page_frame: &CapturedVideoFrame,
@@ -1798,7 +1800,16 @@ fn cursor_for_video_frame(
 ) -> RecordingCursorState {
     let animated = history.interpolated_at(timestamp);
     let anchored = history.at(page_frame.timestamp);
-    if animated.buttons != 0 || anchored.buttons != 0 {
+    let same_press = animated.buttons != 0
+        && anchored.buttons == animated.buttons
+        && history
+            .samples
+            .iter()
+            .rev()
+            .take_while(|(time, _)| *time > page_frame.timestamp)
+            .filter(|(time, _)| *time <= timestamp)
+            .all(|(_, state)| state.buttons == animated.buttons);
+    if same_press {
         anchored
     } else {
         animated
@@ -1957,6 +1968,59 @@ mod tests {
         };
         let moving = cursor_for_video_frame(&history, &released_frame, 13.5);
         assert_eq!((moving.x, moving.y, moving.buttons), (360.0, 370.0, 0));
+    }
+
+    #[test]
+    fn cursor_release_and_new_press_do_not_wait_for_page_repaint() {
+        let mut history = RecordingCursorHistory::default();
+        history.record_at(10.0, 100.0, 100.0, 1);
+        history.record_at(11.0, 200.0, 200.0, 1);
+        history.record_at(12.0, 200.0, 200.0, 0);
+        history.record_at(13.0, 400.0, 300.0, 0);
+        history.record_at(14.0, 600.0, 400.0, 0);
+        history.record_at(15.0, 600.0, 400.0, 1);
+        let frame = CapturedVideoFrame {
+            sequence: 0,
+            image_data: Arc::new(Vec::new()),
+            elapsed: Duration::ZERO,
+            captured_at: tokio::time::Instant::now(),
+            timestamp: 11.0,
+            device_width: 1000.0,
+            device_height: 500.0,
+        };
+
+        let released = cursor_for_video_frame(&history, &frame, 12.0);
+        assert_eq!(
+            (released.x, released.y, released.buttons),
+            (200.0, 200.0, 0)
+        );
+        let moving = cursor_for_video_frame(&history, &frame, 13.5);
+        assert_eq!((moving.x, moving.y, moving.buttons), (500.0, 350.0, 0));
+        let pressed_again = cursor_for_video_frame(&history, &frame, 15.0);
+        assert_eq!(
+            (pressed_again.x, pressed_again.y, pressed_again.buttons),
+            (600.0, 400.0, 1)
+        );
+    }
+
+    #[test]
+    fn cursor_press_is_visible_before_the_first_input_repaint() {
+        let mut history = RecordingCursorHistory::default();
+        history.record_at(10.0, 100.0, 100.0, 0);
+        history.record_at(11.0, 200.0, 200.0, 1);
+        let frame = CapturedVideoFrame {
+            sequence: 0,
+            image_data: Arc::new(Vec::new()),
+            elapsed: Duration::ZERO,
+            captured_at: tokio::time::Instant::now(),
+            timestamp: 9.0,
+            device_width: 1000.0,
+            device_height: 500.0,
+        };
+
+        let pressed = cursor_for_video_frame(&history, &frame, 11.0);
+        assert!(pressed.visible);
+        assert_eq!((pressed.x, pressed.y, pressed.buttons), (200.0, 200.0, 1));
     }
 
     #[test]

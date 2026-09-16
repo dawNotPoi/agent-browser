@@ -12938,6 +12938,8 @@ async fn handle_inserttext(cmd: &Value, state: &DaemonState) -> Result<Value, St
 /// Move the session cursor along a deterministic eased curve. Human mode adds
 /// a seeded perpendicular bend and samples the path frequently enough for
 /// animation-heavy pages while preserving exact, reproducible endpoints.
+/// Schedule steps against one clock so Chrome's response time counts toward
+/// the requested duration instead of being added to every step's delay.
 #[allow(clippy::too_many_arguments)]
 async fn move_mouse_interpolated(
     client: &CdpClient,
@@ -12979,11 +12981,12 @@ async fn move_mouse_interpolated(
     } else {
         (0.0, 0.0)
     };
-    let delay = if duration_ms == 0 {
+    let schedule = if duration_ms == 0 {
         None
     } else {
-        Some(tokio::time::Duration::from_micros(
-            duration_ms.saturating_mul(1000) / steps as u64,
+        Some((
+            tokio::time::Instant::now(),
+            tokio::time::Duration::from_millis(duration_ms),
         ))
     };
 
@@ -13011,8 +13014,8 @@ async fn move_mouse_interpolated(
         if let Ok(mut cursor) = recording_cursor.lock() {
             cursor.record(mouse_state.x, mouse_state.y, buttons);
         }
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
+        if let Some((started, duration)) = schedule {
+            tokio::time::sleep_until(started + duration.mul_f64(i as f64 / steps as f64)).await;
         }
     }
     Ok(())
@@ -15275,6 +15278,69 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(interpolated_mouse_steps(10.0, 100, None, true), 7);
         assert_eq!(interpolated_mouse_steps(10.0, 100, None, false), 1);
         assert_eq!(interpolated_mouse_steps(10.0, 100, Some(3), true), 3);
+    }
+
+    #[tokio::test]
+    async fn mouse_move_duration_includes_cdp_response_latency() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut positions = Vec::new();
+            for _ in 0..4 {
+                let message = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let command: Value = serde_json::from_str(&message).unwrap();
+                assert_eq!(command["method"], "Input.dispatchMouseEvent");
+                assert_eq!(command["params"]["buttons"], 1);
+                positions.push((
+                    command["params"]["x"].as_f64().unwrap(),
+                    command["params"]["y"].as_f64().unwrap(),
+                ));
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                ws.send(Message::Text(
+                    json!({ "id": command["id"], "result": {} }).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+            positions
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut mouse = MouseState::default();
+        let history = Arc::new(std::sync::Mutex::new(
+            recording::RecordingCursorHistory::default(),
+        ));
+        let started = tokio::time::Instant::now();
+        move_mouse_interpolated(
+            &client,
+            "page",
+            &mut mouse,
+            400.0,
+            200.0,
+            1000,
+            Some(4),
+            true,
+            42,
+            1,
+            (0.0, 0.0),
+            &history,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(1000));
+        assert!(
+            elapsed < Duration::from_millis(1600),
+            "response latency was added to the movement duration: {elapsed:?}"
+        );
+        let positions = server.await.unwrap();
+        assert_eq!(positions.last(), Some(&(400.0, 200.0)));
+        assert_eq!((mouse.x, mouse.y), (400.0, 200.0));
     }
 
     #[test]

@@ -2459,6 +2459,14 @@ Subcommands:
   up [button]          Release mouse button
   wheel <dy> [dx]      Scroll mouse wheel
 
+Movement Options:
+  --duration <ms>       Target total duration, including browser response time
+  --steps <n>           Number of movement events (1-240)
+  --human               Use a reproducible eased curve
+  --seed <n>            Seed for the human movement path
+
+Steps share one schedule; a slow browser can extend the requested duration.
+
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
@@ -2929,6 +2937,9 @@ ffmpeg, or apt install ffmpeg). Run `agent-browser doctor` to check.
 Recording captures 30 fps, which keeps scrolls and CSS transitions smooth.
 Raise it to 60 for short, motion-heavy takes (drag interactions, animation
 work); lower it for long sessions where file size matters more than motion.
+
+With --cursor, the pointer follows captured page frames during a drag.
+Mouse release resumes free movement immediately, even on a static page.
 
 Operations:
   start <path> [url]     Start recording the active page (navigates first if url given)

@@ -386,7 +386,7 @@ agent-browser click @e3
 agent-browser record stop
 ```
 
-Recording uses the active tab. Use `--cursor` for an animated pointer, `--contact-sheet` for a visual summary, and `--fps 60` for motion-heavy recordings.
+Recording uses the active tab. Use `--cursor` for an animated pointer, `--contact-sheet` for a visual summary, and `--fps 60` for motion-heavy recordings. The recorded pointer follows captured page frames during a drag and resumes free movement immediately on release, including on static pages.
 
 See [references/video-recording.md](references/video-recording.md) for frame rate guidance, codec options, and more.
 
