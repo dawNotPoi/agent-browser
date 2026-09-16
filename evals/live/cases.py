@@ -87,6 +87,18 @@ def has_sequence(args, sequence):
     return any(args[i:i + len(sequence)] == sequence for i in range(len(args)))
 
 
+def successful_command_spans(starts, finishes, actions):
+    starts_by_id = {command.get("id"): command for command in starts if command.get("id")}
+    spans = []
+    for finish in finishes:
+        start = starts_by_id.get(finish.get("id"))
+        if not start or finish.get("exit_code") != 0 or not any(action in finish.get("args", []) for action in actions):
+            continue
+        if isinstance(start.get("time_ns"), int) and isinstance(finish.get("time_ns"), int):
+            spans.append((start["time_ns"], finish["time_ns"]))
+    return spans
+
+
 def skill_attempted(tool_calls):
     for call in tool_calls:
         name = str(call.get("name", "")).lower()
@@ -162,9 +174,15 @@ def grade(case, workspace, url, heading, commands, tool_calls, events, answer, c
         checks["correct_heading"] = heading in answer
         details["screenshot_dimensions"] = dimensions
     elif case.id == "form-submit":
-        checks["registration_submitted"] = any(e.get("method") == "POST" and e.get("path") == "/register"
-            and e.get("fields") == {"name": ["Avery Lane"], "email": ["avery@example.test"]} for e in events)
-        checks["form_interacted_with_browser"] = any(any(arg in ("fill", "type", "click", "press", "find", "eval") for arg in c["args"]) for c in successful)
+        submissions = [event for event in events if event.get("method") == "POST" and event.get("path") == "/register"
+                       and event.get("fields") == {"name": ["Avery Lane"], "email": ["avery@example.test"]}]
+        submit_spans = successful_command_spans(starts, finishes, ("click", "press", "eval"))
+        grace_ns = 2_000_000_000
+        checks["registration_submitted"] = bool(submissions)
+        checks["form_interacted_with_browser"] = any(event.get("browser_form") is True
+            and isinstance(event.get("time_ns"), int)
+            and any(start <= event["time_ns"] <= finish + grace_ns for start, finish in submit_spans)
+            for event in submissions)
     elif case.id == "local-doc-edit":
         readme = workspace / "README.md"
         checks["exact_edit"] = readme.is_file() and readme.read_text() == README.replace("Browser setup", "Browser configuration")

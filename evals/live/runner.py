@@ -55,7 +55,7 @@ class Fixture:
             def do_GET(self):
                 path = urlsplit(self.path).path
                 content = page(path, owner.heading)
-                owner.events.append({"method": "GET", "path": path})
+                owner.events.append({"method": "GET", "path": path, "time_ns": time.time_ns()})
                 self.send_response(200 if content else 404)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
@@ -65,7 +65,12 @@ class Fixture:
                 path = urlsplit(self.path).path
                 length = int(self.headers.get("Content-Length", "0"))
                 fields = parse_qs(self.rfile.read(min(length, 16384)).decode())
-                owner.events.append({"method": "POST", "path": path, "fields": fields})
+                user_agent = self.headers.get("User-Agent", "")
+                referer = urlsplit(self.headers.get("Referer", ""))
+                owner.events.append({"method": "POST", "path": path, "fields": fields,
+                                     "time_ns": time.time_ns(),
+                                     "browser_form": self.headers.get("Origin") == owner.url
+                                     and referer.path == "/signup" and "Chrome/" in user_agent})
                 self.send_response(200 if path == "/register" else 404)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
@@ -120,6 +125,22 @@ def codex_trace(rows):
         if row.get("type") == "event_msg" and payload.get("type") == "agent_message":
             answer = payload.get("message", answer)
     return {"completed": completed, "answer": answer, "tool_calls": calls, "model": model}
+
+
+def read_provider_trace(provider, observations, rollout=None):
+    if provider == "claude":
+        return claude_trace(read_jsonl(observations / "hooks.jsonl"))
+    if rollout:
+        return codex_trace(read_jsonl(rollout))
+    return {"completed": False, "answer": "", "tool_calls": [], "model": None}
+
+
+def trace_after_flush(provider, observations, rollout=None, discover_rollout=None):
+    """Wait for provider persistence, then read the final trace once more."""
+    time.sleep(0.5)
+    if provider == "codex" and rollout is None and discover_rollout:
+        rollout = discover_rollout()
+    return read_provider_trace(provider, observations, rollout), rollout
 
 
 def skill_sources(rows, tool_calls):
@@ -338,26 +359,26 @@ def run_case(args, provider, mode, case, trial, folder):
             last_progress = time.monotonic()
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
-                if provider == "claude":
-                    trace = claude_trace(read_jsonl(observations / "hooks.jsonl"))
-                else:
+                if provider == "codex":
                     rollout = rollout or find_rollout(workspace, started, args.codex_root)
-                    if rollout:
-                        trace = codex_trace(read_jsonl(rollout))
+                trace = read_provider_trace(provider, observations, rollout)
                 if trace["completed"]:
                     break
                 if process is not None and process.poll() is not None:
                     # Let the provider flush its transcript after process exit.
-                    time.sleep(0.5)
-                    if provider == "claude":
-                        trace = claude_trace(read_jsonl(observations / "hooks.jsonl"))
-                    elif rollout:
-                        trace = codex_trace(read_jsonl(rollout))
+                    trace, rollout = trace_after_flush(provider, observations, rollout,
+                        lambda: find_rollout(workspace, started, args.codex_root))
                     if not trace["completed"]:
                         error = f"CLI exited with {process.returncode} before a completion event was observed"
                     break
                 if (observations / "exit.json").exists():
-                    error = "Interactive CLI exited before a completion event was observed"
+                    # The launcher can write its exit marker between the trace
+                    # poll above and this check. Give the provider time to flush
+                    # its final event, then read the trace once more.
+                    trace, rollout = trace_after_flush(provider, observations, rollout,
+                        lambda: find_rollout(workspace, started, args.codex_root))
+                    if not trace["completed"]:
+                        error = "Interactive CLI exited before a completion event was observed"
                     break
                 if terminal:
                     screen = terminal.capture()

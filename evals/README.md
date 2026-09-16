@@ -60,7 +60,7 @@ Use repeated `--case` flags to select cases, `--timeout` for a per-case limit in
 - `local-doc-edit`: edit browser-related prose in a README without activating the browser skill.
 - `local-code-fix`: fix local URL handling without activating the browser skill. The disposable Vercel guest restores and runs an independent test oracle.
 
-Browser cases require a successful `skills get core` before the first browser action starts. Hypothetical commands do not count. Failed commands and recovery remain visible. Negative cases reject CLI invocations and observed skill activation attempts, even when the edit succeeds. Missing native provider completion events fail closed.
+Browser cases require a successful `skills get core` before the first browser action starts. Hypothetical commands do not count. Form submissions must arrive as a Chrome form request correlated with a successful submit-capable browser command. Failed commands and recovery remain visible. Negative cases reject CLI invocations and observed skill activation attempts, even when the edit succeeds. Missing native provider completion events fail closed.
 
 Results default to `evals/results/sandbox-<timestamp>/`. The top-level `results.json` contains scores and comparisons grouped by provider, case, repetition, and browser mode. Each trial includes `sandbox.json`, `result.json`, and `artifacts.tar.gz`. Extract the archive to inspect prompts, provider transcripts, commands, fixture events, final answers, screenshots, workspace changes, and terminal captures. The runner downloads available artifacts and stops the VM after success or failure. VM lifetimes are bounded independently of the local process. A missing report or artifact download failure fails the trial.
 

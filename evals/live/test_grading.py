@@ -3,10 +3,11 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from live.cases import CASES, README, grade, prepare
-from live.runner import Terminal, claude_trace, codex_trace, comparison
+from live.runner import Terminal, claude_trace, codex_trace, comparison, read_provider_trace, trace_after_flush
 
 
 class LiveGradingTests(unittest.TestCase):
@@ -80,8 +81,60 @@ class LiveGradingTests(unittest.TestCase):
         self.assertFalse(self.assess("form-submit", answer="Registration complete")["checks"]["registration_submitted"])
 
     def test_wrong_registration_fields_fail(self):
-        events = [{"method": "POST", "path": "/register", "fields": {"name": ["Wrong"], "email": ["wrong@example.test"]}}]
+        events = [{"method": "POST", "path": "/register", "fields": {"name": ["Wrong"], "email": ["wrong@example.test"]},
+                   "time_ns": 20, "browser_form": True}]
         self.assertFalse(self.assess("form-submit", events=events)["checks"]["registration_submitted"])
+
+    def test_direct_post_with_unrelated_browser_action_fails(self):
+        commands = [
+            {"id": "skill", "event": "finish", "args": ["skills", "get", "core"], "time_ns": 10, "exit_code": 0},
+            {"id": "open", "event": "start", "args": ["open", "URL"], "time_ns": 20},
+            {"id": "open", "event": "finish", "args": ["open", "URL"], "time_ns": 30, "exit_code": 0},
+            {"id": "find", "event": "start", "args": ["find", "text", "Register"], "time_ns": 40},
+            {"id": "find", "event": "finish", "args": ["find", "text", "Register"], "time_ns": 50, "exit_code": 0},
+        ]
+        events = [
+            {"method": "GET", "path": "/signup", "time_ns": 25},
+            {"method": "POST", "path": "/register", "fields": {"name": ["Avery Lane"], "email": ["avery@example.test"]},
+             "time_ns": 45, "browser_form": False},
+        ]
+        result = self.assess("form-submit", commands=commands, events=events)
+        self.assertTrue(result["checks"]["registration_submitted"])
+        self.assertFalse(result["checks"]["form_interacted_with_browser"])
+        self.assertFalse(result["passed"])
+
+    def test_browser_form_post_during_submit_action_passes(self):
+        commands = [
+            {"id": "skill", "event": "finish", "args": ["skills", "get", "core"], "time_ns": 10, "exit_code": 0},
+            {"id": "open", "event": "start", "args": ["open", "URL"], "time_ns": 20},
+            {"id": "open", "event": "finish", "args": ["open", "URL"], "time_ns": 30, "exit_code": 0},
+            {"id": "click", "event": "start", "args": ["click", "@e2"], "time_ns": 40},
+            {"id": "click", "event": "finish", "args": ["click", "@e2"], "time_ns": 50, "exit_code": 0},
+        ]
+        events = [
+            {"method": "GET", "path": "/signup", "time_ns": 25},
+            {"method": "POST", "path": "/register", "fields": {"name": ["Avery Lane"], "email": ["avery@example.test"]},
+             "time_ns": 45, "browser_form": True},
+        ]
+        result = self.assess("form-submit", commands=commands, events=events)
+        self.assertTrue(result["checks"]["form_interacted_with_browser"])
+        self.assertTrue(result["passed"])
+
+    def test_browser_form_post_outside_submit_action_fails(self):
+        commands = [
+            {"id": "skill", "event": "finish", "args": ["skills", "get", "core"], "time_ns": 10, "exit_code": 0},
+            {"id": "open", "event": "start", "args": ["open", "URL"], "time_ns": 20},
+            {"id": "click", "event": "start", "args": ["click", "@e2"], "time_ns": 30},
+            {"id": "click", "event": "finish", "args": ["click", "@e2"], "time_ns": 40, "exit_code": 0},
+        ]
+        events = [
+            {"method": "GET", "path": "/signup", "time_ns": 25},
+            {"method": "POST", "path": "/register", "fields": {"name": ["Avery Lane"], "email": ["avery@example.test"]},
+             "time_ns": 2_000_000_041, "browser_form": True},
+        ]
+        result = self.assess("form-submit", commands=commands, events=events)
+        self.assertFalse(result["checks"]["form_interacted_with_browser"])
+        self.assertFalse(result["passed"])
 
     def test_task_outcome_cannot_hide_missing_completion(self):
         (self.workspace / "README.md").write_text(README.replace("Browser setup", "Browser configuration"))
@@ -139,6 +192,15 @@ def normalize_url(url):
         self.assertTrue(claude_trace([{"hook_event_name": "Stop", "last_assistant_message": "Done"}])["completed"])
         self.assertFalse(claude_trace([{"hook_event_name": "StopFailure", "last_assistant_message": "Failed"}])["completed"])
         self.assertTrue(codex_trace([{"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "Done"}}])["completed"])
+
+    def test_exit_rechecks_trace_after_provider_flush(self):
+        events = [[], [{"hook_event_name": "Stop", "last_assistant_message": "Done"}]]
+        with patch("live.runner.read_jsonl", side_effect=events), patch("live.runner.time.sleep") as sleep:
+            self.assertFalse(read_provider_trace("claude", self.workspace)["completed"])
+            trace, rollout = trace_after_flush("claude", self.workspace)
+            self.assertTrue(trace["completed"])
+            self.assertIsNone(rollout)
+        sleep.assert_called_once_with(0.5)
 
     def test_comparison_pairs_provider_case_and_trial(self):
         rows = [{"provider": "claude", "case": "page-screenshot", "trial": 1, "mode": "interactive", "passed": True},
