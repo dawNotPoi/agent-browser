@@ -2005,12 +2005,6 @@ When enabled, agent-browser connects to an AgentCore cloud browser session inste
 
 Apache-2.0
 
-## Experimental Obscura provider
+## Obscura (experimental)
 
-Select `--engine obscura --executable-path /path/to/obscura` to launch a local Obscura binary. This provider is experimental. Obscura v0.2.2 has known accessibility naming, hidden-element, iframe and screenshot fidelity gaps; successful CDP connection does not establish Chrome parity. Use Chrome for workflows that depend on these features until validated against your target pages.
-
-Local development pages require `OBSCURA_ALLOW_PRIVATE_NETWORK=1` in the environment before the session starts. Close and relaunch the named session when changing engine launch settings. Stealth support depends on how the Obscura binary was built. Unsupported options including `--webgpu`, `--ca-cert`, `--args`, and `--proxy-bypass` are rejected. Proxy bypass rules from `proxyBypass` config, `AGENT_BROWSER_PROXY_BYPASS`, `NO_PROXY`, or `no_proxy` are also rejected, even without a proxy. Remove those settings only if bypass is not needed; otherwise use Chrome. Explicit `--engine obscura` launches validate the current invocation's resolved bypass settings, even with an existing daemon; clearing those settings does not reuse stale daemon environment values. Startup discovery and CDP initialization each have a 10-second deadline, with bounded connection cleanup on initialization failure.
-
-MCP tools use the same provider through `extraArgs`: `["--engine", "obscura", "--executable-path", "/path/to/obscura"]`. A separate engine-specific MCP tool is unnecessary because tools delegate to the canonical CLI parser.
-
-Verify the adapter without an engine using `cd cli && cargo test --locked -j 2 obscura -- --test-threads=1`. To explicitly verify a real binary, run `cd cli && OBSCURA_BIN=/absolute/path/to/obscura cargo test --locked -j 2 e2e_obscura -- --ignored --test-threads=1`. Both ignored E2E tests fail if `OBSCURA_BIN` is missing, empty, invalid, or cannot launch. They enable private-network access for a loopback fixture, isolate proxy settings, clear `AGENT_BROWSER_CDP`, `AGENT_BROWSER_AUTO_CONNECT`, and `AGENT_BROWSER_PROVIDER`, and require an owned Obscura process rather than an attached browser. They check explicit/automatic launch, navigation, JavaScript, a basic snapshot, and close. Passing them does not establish accessibility, iframe, or screenshot fidelity.
+Use `--engine obscura --executable-path /path/to/obscura` to launch a local Obscura binary. Obscura v0.2.2 has accessibility, iframe, and rendering limitations; use Chrome when fidelity matters. See the [engine documentation](https://agent-browser.dev/engines/obscura) for setup, configuration, and MCP usage, and the [contributor guide](AGENTS.md#obscura-adapter) for source-build testing.
