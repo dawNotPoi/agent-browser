@@ -4131,8 +4131,7 @@ Environment:
   BROWSER_USE_ENABLE_RECORDING   Record the Browser Use Cloud session
                                  Browser Use setup: 18s total, plus up to 4s timeout cleanup.
                                  close fails and stays retryable until the Cloud session confirms it
-                                 stopped. Recovery: <socket-dir>/browser-use-<id>.receipt
-                                 (verify Cloud status; stale receipts can remain).
+                                 stopped. After daemon exit, inspect and stop the browser in Cloud.
   AGENT_BROWSER_AUTO_CONNECT     Auto-discover and connect to running Chrome
   AGENT_BROWSER_PIN_TAB          Pin the session to its bound tab (strict tab binding)
   AGENT_BROWSER_ALLOW_FILE_ACCESS Allow file:// URLs to access local files

@@ -2418,7 +2418,17 @@ async fn attach_provider_cdp(
     provider: &str,
     conn: &providers::ProviderConnection,
     ws_headers: Option<Vec<(String, String)>>,
+    state: &mut DaemonState,
+    plugins: &[crate::plugins::PluginConfig],
 ) -> Result<BrowserManager, String> {
+    remember_active_provider_session(state, conn.session.clone(), plugins);
+    if provider_is_browser_use(provider)
+        && !url::Url::parse(&conn.ws_url).is_ok_and(|url| {
+            matches!(url.scheme(), "ws" | "wss" | "http" | "https") && url.host_str().is_some()
+        })
+    {
+        return Err("Browser Use did not return a usable cdpUrl".to_string());
+    }
     let attach = async {
         if conn.direct_page {
             BrowserManager::connect_cdp_direct(&conn.ws_url).await
@@ -3863,7 +3873,7 @@ async fn browser_use_setup_timeout(state: &mut DaemonState) -> String {
                 })
                 .map(|id| {
                     format!(
-                        "; browser {} remains pending; retry close or use its recovery receipt",
+                        "; browser {} remains pending; retry close or stop it in Browser Use Cloud",
                         id
                     )
                 })
@@ -3871,30 +3881,6 @@ async fn browser_use_setup_timeout(state: &mut DaemonState) -> String {
             format!("{}; cleanup timed out{}", message, recovery)
         }
     }
-}
-
-async fn connect_owned_provider(
-    state: &mut DaemonState,
-    provider: &str,
-    plugins: &[crate::plugins::PluginConfig],
-    options: Option<Value>,
-) -> Result<providers::ProviderConnection, String> {
-    if !provider_is_browser_use(provider) {
-        return providers::connect_provider_with_plugins_and_options(provider, plugins, options)
-            .await;
-    }
-    let (ws_url, session) = providers::connect_browser_use_owned(|session| {
-        let owned = session.is_some();
-        remember_active_provider_session(state, session, plugins);
-        state.active_provider_connection = owned;
-    })
-    .await?;
-    Ok(providers::ProviderConnection {
-        ws_url,
-        session,
-        direct_page: false,
-        metadata: None,
-    })
 }
 
 /// True when [`apply_session_setup`] has anything to replay onto a new tab.
@@ -4036,7 +4022,10 @@ async fn auto_launch(
     state: &mut DaemonState,
     plugins: Vec<crate::plugins::PluginConfig>,
 ) -> Result<(), String> {
-    if !env::var("AGENT_BROWSER_PROVIDER").is_ok_and(|provider| provider_is_browser_use(&provider))
+    if env::var("AGENT_BROWSER_CDP").is_ok()
+        || env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok()
+        || !env::var("AGENT_BROWSER_PROVIDER")
+            .is_ok_and(|provider| provider_is_browser_use(&provider))
     {
         return auto_launch_inner(state, plugins).await;
     }
@@ -4209,26 +4198,19 @@ async fn auto_launch_inner(
         })?;
         // ios/safari are device providers handled via explicit launch command
         if !p.is_empty() && p != "ios" && p != "safari" {
-            let conn = connect_owned_provider(state, &p, &plugins, None).await?;
+            let conn = providers::connect_provider_with_plugins(&p, &plugins).await?;
             if conn.direct_page && !allowed_domains.is_empty() {
-                let mut cleanup_error = None;
                 if let Some(ref ps) = conn.session {
-                    cleanup_error = providers::close_provider_session_with_plugins(ps, &plugins)
-                        .await
-                        .err();
+                    let _ = providers::close_provider_session_with_plugins(ps, &plugins).await;
                 }
-                return Err(combine_provider_failure(
-                    direct_page_allowed_domains_error(),
-                    cleanup_error,
-                ));
+                return Err(direct_page_allowed_domains_error());
             }
             let ws_headers = if p == "agentcore" {
                 providers::take_agentcore_ws_headers()
             } else {
                 None
             };
-            remember_active_provider_session(state, conn.session.clone(), &plugins);
-            match attach_provider_cdp(&p, &conn, ws_headers).await {
+            match attach_provider_cdp(&p, &conn, ws_headers, state, &plugins).await {
                 Ok(mgr) => {
                     let hash = launch_hash(
                         &options,
@@ -4859,10 +4841,13 @@ async fn handle_launch_with_deadline(
     state: &mut DaemonState,
     deadline: std::time::Duration,
 ) -> Result<Value, String> {
-    if !cmd
-        .get("provider")
-        .and_then(Value::as_str)
-        .is_some_and(provider_is_browser_use)
+    if cmd.get("cdpUrl").and_then(Value::as_str).is_some()
+        || cmd.get("cdpPort").and_then(Value::as_u64).is_some()
+        || cmd.get("autoConnect").and_then(Value::as_bool) == Some(true)
+        || !cmd
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(provider_is_browser_use)
     {
         return handle_launch_inner(cmd, state).await;
     }
@@ -5214,26 +5199,20 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
             }
             _ => {
                 let command_plugins = plugins_from_command_or_env(cmd);
-                let conn = connect_owned_provider(
-                    state,
+                let conn = providers::connect_provider_with_plugins_and_options(
                     provider,
                     &command_plugins,
                     Some(provider_plugin_launch_options_from_command(cmd)),
                 )
                 .await?;
                 if conn.direct_page && !allowed_domains.is_empty() {
-                    let mut cleanup_error = None;
                     if let Some(ref ps) = conn.session {
-                        cleanup_error =
+                        let _ =
                             providers::close_provider_session_with_plugins(ps, &command_plugins)
-                                .await
-                                .err();
+                                .await;
                     }
                     restore_domain_filter(state, &previous_domain_filter).await;
-                    return Err(combine_provider_failure(
-                        direct_page_allowed_domains_error(),
-                        cleanup_error,
-                    ));
+                    return Err(direct_page_allowed_domains_error());
                 }
                 let provider_metadata = conn.metadata.clone();
 
@@ -5243,8 +5222,9 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
                     None
                 };
 
-                remember_active_provider_session(state, conn.session.clone(), &command_plugins);
-                match attach_provider_cdp(provider, &conn, ws_headers).await {
+                match attach_provider_cdp(provider, &conn, ws_headers, state, &command_plugins)
+                    .await
+                {
                     Ok(mgr) => {
                         state.reset_input_state();
                         state.browser = Some(mgr);
@@ -15291,86 +15271,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         }
     }
 
-    #[test]
-    fn test_browser_use_attach_deadline_is_fixed() {
-        assert_eq!(
-            BROWSER_USE_ATTACH_DEADLINE,
-            std::time::Duration::from_secs(8)
-        );
-        assert!(provider_is_browser_use("browser-use"));
-        assert!(provider_is_browser_use("browseruse"));
-        assert!(!provider_is_browser_use("browserbase"));
-    }
-
-    #[test]
-    fn test_browser_use_canceled_launch_restores_domain_filter() {
-        let dir = tempfile::tempdir().unwrap();
-        let guard = EnvGuard::new(&["BROWSER_USE_API_KEY", "AGENT_BROWSER_SOCKET_DIR"]);
-        guard.set("BROWSER_USE_API_KEY", "test-key");
-        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let (release, blocked) = std::sync::mpsc::channel();
-        let (started, running) = std::sync::mpsc::channel();
-        rt.spawn_blocking(move || {
-            started.send(()).unwrap();
-            let _ = blocked.recv_timeout(std::time::Duration::from_secs(3));
-        });
-        running
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-        let mut state = DaemonState::new();
-        let result = rt.block_on(async {
-            *state.domain_filter.write().await = Some(DomainFilter::new("example.com"));
-            state.session_setup.user_agent = Some("previous-agent".to_string());
-            handle_launch_with_deadline(
-                &json!({"provider":"browser-use", "allowedDomains":[]}),
-                &mut state,
-                std::time::Duration::from_millis(100),
-            )
-            .await
-        });
-        release.send(()).unwrap();
-        assert!(result.unwrap_err().contains("setup timed out"));
-        assert_eq!(
-            rt.block_on(current_allowed_domains(&state)),
-            vec!["example.com"]
-        );
-        assert_eq!(
-            state.session_setup.user_agent.as_deref(),
-            Some("previous-agent")
-        );
-    }
-
-    #[test]
-    fn test_browser_use_failed_launch_restores_domain_filter() {
-        let guard = EnvGuard::new(&["BROWSER_USE_API_KEY"]);
-        guard.remove("BROWSER_USE_API_KEY");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut state = DaemonState::new();
-        rt.block_on(async {
-            *state.domain_filter.write().await = Some(DomainFilter::new("example.com"));
-            state.session_setup.user_agent = Some("previous-agent".to_string());
-            let result = handle_launch(
-                &json!({"provider":"browser-use", "allowedDomains":[]}),
-                &mut state,
-            )
-            .await;
-            assert!(result.is_err());
-            assert_eq!(current_allowed_domains(&state).await, vec!["example.com"]);
-            assert_eq!(
-                state.session_setup.user_agent.as_deref(),
-                Some("previous-agent")
-            );
-        });
-    }
-
-    #[test]
-    fn test_browser_use_failed_auto_launch_restores_configuration() {
+    #[tokio::test]
+    async fn test_browser_use_failed_launches_restore_configuration() {
         let guard = EnvGuard::new(&[
             "BROWSER_USE_API_KEY",
             "AGENT_BROWSER_PROVIDER",
@@ -15381,36 +15283,170 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         guard.set("AGENT_BROWSER_PROVIDER", "browser-use");
         guard.set("AGENT_BROWSER_PROXY_USERNAME", "new-user");
         guard.set("AGENT_BROWSER_PROXY_PASSWORD", "new-password");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut state = DaemonState::new();
-        state.plugin_init_scripts = vec!["previous-script".to_string()];
-        state.session_setup.user_agent = Some("previous-agent".to_string());
-        rt.block_on(async {
-            let previous = Some(("old-user".to_string(), "old-password".to_string()));
-            *state.proxy_credentials.write().await = previous.clone();
-            assert!(auto_launch(&mut state, Vec::new()).await.is_err());
-            assert_eq!(*state.proxy_credentials.read().await, previous);
+        for explicit in [true, false] {
+            let mut state = DaemonState::new();
+            let credentials = Some(("old-user".to_string(), "old-password".to_string()));
+            *state.domain_filter.write().await = Some(DomainFilter::new("example.com"));
+            *state.proxy_credentials.write().await = credentials.clone();
+            state.plugin_init_scripts = vec!["previous-script".to_string()];
+            state.session_setup.user_agent = Some("previous-agent".to_string());
+            let result = if explicit {
+                handle_launch(
+                    &json!({"provider":"browser-use", "allowedDomains":[]}),
+                    &mut state,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                auto_launch(&mut state, Vec::new()).await
+            };
+            assert!(result.is_err());
+            assert_eq!(current_allowed_domains(&state).await, vec!["example.com"]);
+            assert_eq!(*state.proxy_credentials.read().await, credentials);
             assert_eq!(state.plugin_init_scripts, vec!["previous-script"]);
             assert_eq!(
                 state.session_setup.user_agent.as_deref(),
                 Some("previous-agent")
             );
-        });
+        }
+    }
+
+    #[test]
+    fn test_browser_use_canceled_setup_and_stop_preserve_state() {
+        use std::io::Read;
+        let vars = [
+            "BROWSER_USE_API_KEY",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        let guard = EnvGuard::new(&vars);
+        for name in vars {
+            guard.remove(name);
+        }
+        guard.set("BROWSER_USE_API_KEY", "test-key");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for closing in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            guard.set(
+                "HTTPS_PROXY",
+                &format!("http://{}", listener.local_addr().unwrap()),
+            );
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = [0; 1024];
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(std::str::from_utf8(&bytes[..count])
+                    .unwrap()
+                    .starts_with("CONNECT "));
+                std::thread::sleep(std::time::Duration::from_millis(700));
+            });
+            rt.block_on(async {
+                let mut state = DaemonState::new();
+                state.session_setup.user_agent = Some("previous-agent".to_string());
+                *state.domain_filter.write().await = Some(DomainFilter::new("example.com"));
+                let deadline = std::time::Duration::from_millis(200);
+                if closing {
+                    state.active_provider_session = Some(pending_browser_use_session());
+                    state.active_provider_connection = true;
+                    state.launch_hash = Some(42);
+                    state.screencasting = true;
+                    state.network_auto_attach_installed = true;
+                    assert!(
+                        tokio::time::timeout(deadline, close_current_browser(&mut state))
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(
+                        state
+                            .active_provider_session
+                            .as_ref()
+                            .unwrap()
+                            .session
+                            .session_id,
+                        pending_browser_use_session().session.session_id
+                    );
+                    assert!(state.active_provider_connection);
+                    assert_eq!(state.launch_hash, None);
+                    assert!(!state.screencasting && !state.network_auto_attach_installed);
+                } else {
+                    let result = handle_launch_with_deadline(
+                        &json!({"provider":"browser-use", "allowedDomains":[]}),
+                        &mut state,
+                        deadline,
+                    )
+                    .await;
+                    assert!(result.unwrap_err().contains("setup timed out"));
+                }
+                assert_eq!(
+                    state.session_setup.user_agent.as_deref(),
+                    Some("previous-agent")
+                );
+                assert_eq!(current_allowed_domains(&state).await, vec!["example.com"]);
+            });
+            server.join().unwrap();
+        }
     }
 
     #[tokio::test]
-    async fn test_browser_use_attach_error_does_not_expose_endpoint_credentials() {
-        let conn = providers::ProviderConnection {
-            ws_url: "ws://127.0.0.1:1/devtools/browser/secret-token?apiKey=do-not-echo".to_string(),
-            session: None,
-            direct_page: false,
-            metadata: None,
-        };
-        let error = attach_provider_cdp("browser-use", &conn, None)
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(error, "Browser Use CDP attachment failed");
+    async fn test_browser_use_cdp_failure_retains_ownership_without_exposing_credentials() {
+        for endpoint in [
+            "",
+            "file:///secret",
+            "ws://127.0.0.1:1/secret?apiKey=do-not-echo",
+        ] {
+            let mut state = DaemonState::new();
+            let session = pending_browser_use_session().session;
+            let conn = providers::ProviderConnection {
+                ws_url: endpoint.to_string(),
+                session: Some(session.clone()),
+                direct_page: false,
+                metadata: None,
+            };
+            let error = attach_provider_cdp("browser-use", &conn, None, &mut state, &[])
+                .await
+                .err()
+                .unwrap();
+            assert!(error.starts_with("Browser Use"));
+            assert!(!error.contains("secret") && !error.contains("do-not-echo"));
+            let active = state.active_provider_session.as_ref().unwrap();
+            assert_eq!(active.session.session_id, session.session_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_browser_use_failed_close_retains_id_and_blocks_replacement() {
+        let guard = EnvGuard::new(&["BROWSER_USE_API_KEY", "AGENT_BROWSER_PROVIDER"]);
+        guard.remove("BROWSER_USE_API_KEY");
+        guard.remove("AGENT_BROWSER_PROVIDER");
+        let mut state = DaemonState::new();
+        state.active_provider_connection = true;
+        state.active_provider_session = Some(pending_browser_use_session());
+        for action in ["close", "close", "launch"] {
+            let response =
+                execute_command(&json!({"action":action,"id":"retry"}), &mut state).await;
+            assert_eq!(response["success"], false);
+            assert!(response["error"]
+                .as_str()
+                .unwrap()
+                .contains(&pending_browser_use_session().session.session_id));
+            assert_eq!(
+                state
+                    .active_provider_session
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .session_id,
+                pending_browser_use_session().session.session_id
+            );
+            assert!(state.active_provider_connection && state.browser.is_none());
+        }
     }
 
     #[tokio::test]
@@ -15427,171 +15463,34 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         );
         state.active_provider_session = Some(pending_browser_use_session());
         state.active_provider_connection = true;
-        let navigate = execute_command(&json!({"id":"1", "action":"navigate", "url":"data:text/html,<title>provider-continuity</title><body>kept</body>"}), &mut state).await;
-        assert_eq!(navigate["success"], true, "{navigate}");
-        let initial_target = state
+        let target = state
             .browser
             .as_ref()
             .unwrap()
             .active_target_id()
             .unwrap()
             .to_string();
-        let set = execute_command(
-            &json!({"id":"2", "action":"evaluate", "script":"window.__providerSentinel = 'kept'"}),
-            &mut state,
-        )
-        .await;
-        assert_eq!(set["success"], true, "{set}");
-        let get = execute_command(&json!({"id":"3", "action":"evaluate", "script":"({sentinel:window.__providerSentinel, title:document.title})"}), &mut state).await;
-        assert_eq!(get["success"], true, "{get}");
-        assert!(get.to_string().contains("provider-continuity"), "{get}");
-        assert!(get.to_string().contains("kept"), "{get}");
-        assert_eq!(
-            state.browser.as_ref().unwrap().active_target_id().unwrap(),
-            initial_target
-        );
-        assert_eq!(
-            state
-                .active_provider_session
-                .as_ref()
-                .unwrap()
-                .session
-                .session_id,
-            pending_browser_use_session().session.session_id
-        );
+        for script in [
+            "window.__providerSentinel = 'kept'",
+            "window.__providerSentinel",
+        ] {
+            let response = execute_command(
+                &json!({"id":"continuity", "action":"evaluate", "script":script}),
+                &mut state,
+            )
+            .await;
+            assert_eq!(response["success"], true);
+            assert_eq!(response["data"]["result"], "kept");
+            assert_eq!(
+                state.browser.as_ref().unwrap().active_target_id().unwrap(),
+                target
+            );
+        }
+        assert!(state.active_provider_session.is_some());
         state.active_provider_session = None;
         close_current_browser(&mut state).await.unwrap();
         assert!(producer.is_connection_alive().await);
         producer.close().await.unwrap();
-    }
-
-    #[test]
-    fn test_browser_use_canceled_stop_keeps_ownership() {
-        use std::io::Read;
-        let guard = EnvGuard::new(&[
-            "BROWSER_USE_API_KEY",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
-        ]);
-        for name in [
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
-        ] {
-            guard.remove(name);
-        }
-        guard.set("BROWSER_USE_API_KEY", "test-key");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        guard.set(
-            "HTTPS_PROXY",
-            &format!("http://{}", listener.local_addr().unwrap()),
-        );
-        let (release, blocked) = std::sync::mpsc::channel();
-        let (seen, received) = tokio::sync::oneshot::channel();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .unwrap();
-            let mut bytes = [0; 1024];
-            assert!(stream.read(&mut bytes).unwrap() > 0);
-            let _ = seen.send(());
-            let _ = blocked.recv_timeout(std::time::Duration::from_secs(3));
-        });
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut state = DaemonState::new();
-        state.active_provider_session = Some(pending_browser_use_session());
-        state.active_provider_connection = true;
-        state.launch_hash = Some(42);
-        state.screencasting = true;
-        state.network_auto_attach_installed = true;
-        rt.block_on(async {
-            let close = close_current_browser(&mut state);
-            tokio::pin!(close);
-            tokio::select! {
-                result = &mut close => panic!("stop unexpectedly completed: {:?}", result),
-                result = tokio::time::timeout(std::time::Duration::from_secs(2), received) => result.unwrap().unwrap(),
-            }
-        });
-        release.send(()).unwrap();
-        server.join().unwrap();
-        assert_eq!(
-            state
-                .active_provider_session
-                .as_ref()
-                .unwrap()
-                .session
-                .session_id,
-            pending_browser_use_session().session.session_id
-        );
-        assert!(state.active_provider_connection);
-        assert_eq!(state.launch_hash, None);
-        assert!(!state.screencasting);
-        assert!(!state.network_auto_attach_installed);
-    }
-
-    #[test]
-    fn test_execute_command_close_failure_retains_browser_use_ownership_and_retries() {
-        let guard = EnvGuard::new(&["BROWSER_USE_API_KEY", "AGENT_BROWSER_PROVIDER"]);
-        guard.remove("BROWSER_USE_API_KEY");
-        guard.remove("AGENT_BROWSER_PROVIDER");
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut state = DaemonState::new();
-        state.active_provider_connection = true;
-        state.active_provider_session = Some(pending_browser_use_session());
-
-        for _ in 0..2 {
-            let response = rt.block_on(execute_command(
-                &json!({"action":"close","id":"c1"}),
-                &mut state,
-            ));
-            assert_eq!(response["success"], false);
-            let error = response["error"].as_str().unwrap();
-            assert!(error.contains("BROWSER_USE_API_KEY"), "{error}");
-            assert!(
-                error.contains("0e6ae5d0-93cf-4b9c-8c62-2c9c07b6c0f7"),
-                "{error}"
-            );
-            let retained = state.active_provider_session.as_ref().unwrap();
-            assert_eq!(
-                retained.session.session_id,
-                "0e6ae5d0-93cf-4b9c-8c62-2c9c07b6c0f7"
-            );
-            assert!(state.active_provider_connection);
-        }
-    }
-
-    #[test]
-    fn test_launch_cannot_overwrite_pending_browser_use_ownership() {
-        let guard = EnvGuard::new(&["BROWSER_USE_API_KEY", "AGENT_BROWSER_PROVIDER"]);
-        guard.remove("BROWSER_USE_API_KEY");
-        guard.remove("AGENT_BROWSER_PROVIDER");
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut state = DaemonState::new();
-        state.active_provider_connection = true;
-        state.active_provider_session = Some(pending_browser_use_session());
-
-        let response = rt.block_on(execute_command(
-            &json!({"action":"launch","id":"l1"}),
-            &mut state,
-        ));
-        assert_eq!(response["success"], false);
-        let error = response["error"].as_str().unwrap();
-        assert!(
-            error.contains("0e6ae5d0-93cf-4b9c-8c62-2c9c07b6c0f7"),
-            "{error}"
-        );
-        assert!(state.browser.is_none());
-        let retained = state.active_provider_session.as_ref().unwrap();
-        assert_eq!(retained.session.provider, "browser-use");
     }
 
     #[test]

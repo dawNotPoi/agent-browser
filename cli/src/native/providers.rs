@@ -5,7 +5,6 @@
 
 use serde_json::{json, Value};
 use std::env;
-use std::path::PathBuf;
 use std::time::Duration;
 
 const BROWSER_USE_API_BASE: &str = "https://api.browser-use.com/api/v4";
@@ -383,16 +382,8 @@ async fn connect_browserless() -> Result<(String, Option<ProviderSession>), Stri
 }
 
 async fn connect_browser_use() -> Result<(String, Option<ProviderSession>), String> {
-    connect_browser_use_at(
-        BROWSER_USE_API_BASE,
-        BROWSER_USE_CREATE_DEADLINE,
-        BROWSER_USE_STOP_DEADLINE,
-    )
-    .await
+    connect_browser_use_at(BROWSER_USE_API_BASE, BROWSER_USE_CREATE_DEADLINE).await
 }
-
-const BROWSER_USE_UNKNOWN_OUTCOME: &str =
-    "the browser may still have been created; inspect Browser Use Cloud before retrying";
 
 fn browser_use_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
@@ -401,190 +392,56 @@ fn browser_use_client() -> Result<reqwest::Client, String> {
         .map_err(|_| "Browser Use HTTP client could not be initialized".to_string())
 }
 
-pub fn browser_use_receipt_path(id: &uuid::Uuid) -> PathBuf {
-    crate::connection::get_socket_dir().join(format!("browser-use-{}.receipt", id))
-}
-
-fn browser_use_receipt_contents(id: &uuid::Uuid) -> String {
-    format!(
-        "Browser Use Cloud recovery receipt\n\
-         provider: browser-use\n\
-         browser_id: {id}\n\
-         \n\
-         This receipt may remain after a confirmed stop if local cleanup fails.\n\
-         Check Cloud before stopping a browser or deleting this receipt.\n\
-         Stop it manually with your API key:\n\
-         \n\
-         curl -X PATCH {BROWSER_USE_API_BASE}/browsers/{id} \\\n\
-           -H \"X-Browser-Use-API-Key: $BROWSER_USE_API_KEY\" \\\n\
-           -H \"Content-Type: application/json\" \\\n\
-           -d '{{\"action\":\"stop\"}}'\n\
-         \n\
-         Or stop it from https://cloud.browser-use.com\n\
-         Delete this file once the browser is confirmed stopped.\n"
-    )
-}
-
-async fn preflight_browser_use_receipt_dir() -> Result<(), String> {
-    let dir = crate::connection::get_socket_dir();
-    tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&dir)?;
-        let probe = dir.join(format!(".browser-use-probe-{}", uuid::Uuid::new_v4()));
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe)?;
-        std::fs::remove_file(probe)
-    })
-    .await
-    .map_err(|_| "Browser Use recovery storage check failed".to_string())?
-    .map_err(|_| {
-        "Browser Use recovery storage is not writable; refusing to create a cloud browser"
-            .to_string()
-    })
-}
-
-pub async fn connect_browser_use_owned<F>(
-    on_session: F,
-) -> Result<(String, Option<ProviderSession>), String>
-where
-    F: FnMut(Option<ProviderSession>),
-{
-    connect_browser_use_at_with_owner(
-        BROWSER_USE_API_BASE,
-        BROWSER_USE_CREATE_DEADLINE,
-        BROWSER_USE_STOP_DEADLINE,
-        on_session,
-    )
-    .await
+async fn browser_use_response(request: reqwest::RequestBuilder) -> Result<Value, String> {
+    fn safe_error(error: reqwest::Error) -> String {
+        if error.is_timeout() {
+            "request timed out"
+        } else if error.is_decode() {
+            "invalid response"
+        } else {
+            "request failed"
+        }
+        .to_string()
+    }
+    let response = request.send().await.map_err(safe_error)?;
+    if !response.status().is_success() {
+        return Err(format!("API error (status {})", response.status().as_u16()));
+    }
+    response.json().await.map_err(safe_error)
 }
 
 async fn connect_browser_use_at(
     base: &str,
-    create_deadline: Duration,
-    stop_deadline: Duration,
+    deadline: Duration,
 ) -> Result<(String, Option<ProviderSession>), String> {
-    connect_browser_use_at_with_owner(base, create_deadline, stop_deadline, |_| {}).await
-}
-
-async fn connect_browser_use_at_with_owner<F>(
-    base: &str,
-    create_deadline: Duration,
-    stop_deadline: Duration,
-    mut on_session: F,
-) -> Result<(String, Option<ProviderSession>), String>
-where
-    F: FnMut(Option<ProviderSession>),
-{
-    let api_key = env::var("BROWSER_USE_API_KEY")
+    let key = env::var("BROWSER_USE_API_KEY")
         .map_err(|_| "BROWSER_USE_API_KEY environment variable is not set")?;
-
-    preflight_browser_use_receipt_dir().await?;
-
-    let response = browser_use_client()?
-        .post(format!("{}/browsers", base))
-        .header("X-Browser-Use-API-Key", &api_key)
-        .header("Content-Type", "application/json")
-        .timeout(create_deadline)
-        .json(&browser_use_create_body_from_lookup(|name| {
-            env::var(name).ok()
-        }))
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                format!(
-                    "Browser Use create timed out after {}s; {}",
-                    create_deadline.as_secs(),
-                    BROWSER_USE_UNKNOWN_OUTCOME
-                )
-            } else {
-                format!(
-                    "Browser Use create request failed before a browser id was received; {}",
-                    BROWSER_USE_UNKNOWN_OUTCOME
-                )
-            }
-        })?;
-
-    let status = response.status();
-    let body = response.text().await.map_err(|e| {
-        if e.is_timeout() {
-            format!(
-                "Browser Use create response stalled past the {}s deadline; {}",
-                create_deadline.as_secs(),
-                BROWSER_USE_UNKNOWN_OUTCOME
-            )
-        } else {
-            format!(
-                "Browser Use create response could not be read; {}",
-                BROWSER_USE_UNKNOWN_OUTCOME
-            )
-        }
-    })?;
-    if !status.is_success() {
-        return Err(format!(
-            "Browser Use API error (status {}); {}",
-            status.as_u16(),
-            BROWSER_USE_UNKNOWN_OUTCOME
-        ));
-    }
-
-    let response: Value = serde_json::from_str(&body).map_err(|_| {
-        format!(
-            "Browser Use returned an invalid create response; {}",
-            BROWSER_USE_UNKNOWN_OUTCOME
-        )
-    })?;
-    let id = response
-        .get("id")
-        .and_then(Value::as_str)
-        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
-        .ok_or_else(|| {
-            format!(
-                "Browser Use create response did not contain a valid browser id; {}",
-                BROWSER_USE_UNKNOWN_OUTCOME
-            )
-        })?;
-
-    if uuid::Uuid::parse_str(&api_key).ok() == Some(id) {
-        return Err(format!(
-            "Browser Use returned an invalid resource identity; {}",
-            BROWSER_USE_UNKNOWN_OUTCOME
-        ));
-    }
-    let session = ProviderSession {
-        provider: "browser-use".to_string(),
-        session_id: id.to_string(),
+    let unknown = |error| {
+        format!("Browser Use create {error}; the browser may still have been created; inspect Browser Use Cloud before retrying")
     };
-    on_session(Some(session.clone()));
-    let receipt_path = browser_use_receipt_path(&id);
-    let write_path = receipt_path.clone();
-    let written = tokio::task::spawn_blocking(move || {
-        std::fs::write(write_path, browser_use_receipt_contents(&id))
-    })
-    .await;
-    let ws_url = response
-        .get("cdpUrl")
-        .and_then(Value::as_str)
-        .filter(|raw| {
-            url::Url::parse(raw).is_ok_and(|url| {
-                matches!(url.scheme(), "ws" | "wss" | "http" | "https") && url.host_str().is_some()
-            })
-        });
-    let failure = if !matches!(written, Ok(Ok(()))) {
-        "recovery receipt could not be written"
-    } else if ws_url.is_none() {
-        "browser did not include a usable cdpUrl"
-    } else {
-        return Ok((ws_url.unwrap().to_string(), Some(session)));
-    };
-    match stop_browser_use_session_at(base, &id.to_string(), stop_deadline).await {
-        Ok(()) => {
-            on_session(None);
-            Err(format!("Browser Use {}; browser {} was stopped", failure, id))
-        }
-        Err(error) => Err(format!("Browser Use {}; rollback failed: {}. Retry close or stop browser {} in Browser Use Cloud", failure, error, id)),
-    }
+    let response = browser_use_response(
+        browser_use_client()?
+            .post(format!("{base}/browsers"))
+            .header("X-Browser-Use-API-Key", &key)
+            .timeout(deadline)
+            .json(&browser_use_create_body_from_lookup(|name| {
+                env::var(name).ok()
+            })),
+    )
+    .await
+    .map_err(unknown)?;
+    let id = response["id"]
+        .as_str()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .filter(|id| Some(*id) != uuid::Uuid::parse_str(&key).ok())
+        .ok_or_else(|| unknown("response did not contain a valid browser id".to_string()))?;
+    Ok((
+        response["cdpUrl"].as_str().unwrap_or_default().to_string(),
+        Some(ProviderSession {
+            provider: "browser-use".to_string(),
+            session_id: id.to_string(),
+        }),
+    ))
 }
 
 async fn stop_browser_use_session_at(
@@ -592,78 +449,36 @@ async fn stop_browser_use_session_at(
     session_id: &str,
     deadline: Duration,
 ) -> Result<(), String> {
-    let id = uuid::Uuid::parse_str(session_id).map_err(|_| {
-        "Browser Use session id is not a valid UUID; refusing to send a stop request".to_string()
+    let id = uuid::Uuid::parse_str(session_id)
+        .map_err(|_| "Browser Use session id is not a valid UUID")?;
+    let key = env::var("BROWSER_USE_API_KEY").map_err(|_| {
+        format!("BROWSER_USE_API_KEY is not set; Browser Use browser {id} was not stopped")
     })?;
-    let api_key = env::var("BROWSER_USE_API_KEY").map_err(|_| {
-        format!(
-            "BROWSER_USE_API_KEY environment variable is not set; Browser Use browser {} was not stopped",
-            id
-        )
-    })?;
-
-    if uuid::Uuid::parse_str(&api_key).ok() == Some(id) {
-        return Err(
-            "Browser Use session identity matches a credential; refusing to expose it".to_string(),
-        );
+    if uuid::Uuid::parse_str(&key).ok() == Some(id) {
+        return Err("Browser Use session identity matches a credential".to_string());
     }
-    let response = browser_use_client()?
-        .patch(format!("{}/browsers/{}", base, id))
-        .header("X-Browser-Use-API-Key", &api_key)
-        .header("Content-Type", "application/json")
-        .timeout(deadline)
-        .json(&json!({ "action": "stop" }))
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                format!(
-                    "Browser Use stop timed out after {}s for browser {}",
-                    deadline.as_secs(),
-                    id
-                )
-            } else {
-                format!("Browser Use stop request failed for browser {}", id)
-            }
-        })?;
-
-    let status = response.status();
-    if !status.is_success() {
+    let response = browser_use_response(
+        browser_use_client()?
+            .patch(format!("{base}/browsers/{id}"))
+            .header("X-Browser-Use-API-Key", key)
+            .timeout(deadline)
+            .json(&json!({ "action": "stop" })),
+    )
+    .await
+    .map_err(|error| format!("Browser Use stop {error} for browser {id}"))?;
+    if response["id"]
+        .as_str()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        != Some(id)
+        || response["status"] != "stopped"
+    {
         return Err(format!(
-            "Browser Use stop failed (status {}) for browser {}",
-            status.as_u16(),
-            id
+            "Browser Use did not acknowledge browser {id} as stopped"
         ));
     }
-    let body = response.text().await.map_err(|_| {
-        format!(
-            "Browser Use stop response could not be read for browser {}",
-            id
-        )
-    })?;
-    let acknowledged = serde_json::from_str::<Value>(&body)
-        .ok()
-        .map(|view| {
-            view.get("id")
-                .and_then(Value::as_str)
-                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
-                == Some(id)
-                && view.get("status").and_then(Value::as_str) == Some("stopped")
-        })
-        .unwrap_or(false);
-    if !acknowledged {
-        return Err(format!(
-            "Browser Use stop response did not acknowledge browser {} as stopped",
-            id
-        ));
-    }
-
-    let _removal =
-        tokio::task::spawn_blocking(move || std::fs::remove_file(browser_use_receipt_path(&id)));
     Ok(())
 }
 
-/// Build the supported Browser Use Cloud V4 options. Custom proxies are not exposed.
 fn browser_use_create_body_from_lookup<F>(mut lookup: F) -> Value
 where
     F: FnMut(&str) -> Option<String>,
@@ -1181,535 +996,202 @@ mod tests {
     use crate::test_utils::EnvGuard;
     use std::io::{Read, Write};
 
-    const BROWSER_USE_ENV_VARS: &[&str] = &[
-        "AGENT_BROWSER_SOCKET_DIR",
-        "AGENT_BROWSER_NAMESPACE",
-        "BROWSER_USE_API_KEY",
-        "BROWSER_USE_PROFILE_ID",
-        "BROWSER_USE_PROXY_COUNTRY",
-        "BROWSER_USE_ENABLE_RECORDING",
-    ];
+    const TEST_BROWSER_ID: &str = "0e6ae5d0-93cf-4b9c-8c62-2c9c07b6c0f7";
 
-    fn browser_use_env(socket_dir: &std::path::Path) -> EnvGuard<'static> {
-        let guard = EnvGuard::new(BROWSER_USE_ENV_VARS);
-        for name in BROWSER_USE_ENV_VARS {
+    fn browser_use_env() -> EnvGuard<'static> {
+        let vars = [
+            "BROWSER_USE_API_KEY",
+            "BROWSER_USE_PROFILE_ID",
+            "BROWSER_USE_PROXY_COUNTRY",
+            "BROWSER_USE_ENABLE_RECORDING",
+        ];
+        let guard = EnvGuard::new(&vars);
+        for name in vars {
             guard.remove(name);
         }
-        guard.set(
-            "AGENT_BROWSER_SOCKET_DIR",
-            socket_dir.to_str().expect("socket dir should be utf-8"),
-        );
         guard.set("BROWSER_USE_API_KEY", "test-key-do-not-echo");
         guard
     }
 
-    fn http_response(status_line: &str, body: &str) -> String {
-        format!(
-            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            status_line,
-            body.len(),
-            body
-        )
-    }
-
-    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 1024];
-        loop {
-            let n = stream.read(&mut chunk).unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-                let content_length: usize = head
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        if name.eq_ignore_ascii_case("content-length") {
-                            value.trim().parse().ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                if buf.len() >= head_end + 4 + content_length {
+    fn browser_use_server(
+        status: u16,
+        body: &str,
+        stall: bool,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = String::new();
+            let mut reader = std::io::BufReader::new(&stream);
+            loop {
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                request.push_str(&line);
+                if line == "\r\n" {
                     break;
                 }
             }
-        }
-        String::from_utf8_lossy(&buf).to_string()
-    }
-
-    fn serve_responses(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            for response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
-                requests.push(read_http_request(&mut stream));
-                stream.write_all(response.as_bytes()).unwrap();
-                let _ = stream.flush();
+            let length = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            request.push_str(std::str::from_utf8(&bytes).unwrap());
+            let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", if stall { body.len() + 10 } else { body.len() });
+            let _ = stream.write_all(response.as_bytes());
+            if stall {
+                std::thread::sleep(Duration::from_millis(500));
             }
-            requests
+            request
         });
-        (base, handle)
+        (base, server)
     }
 
-    fn serve_stalled_body() -> (String, std::thread::JoinHandle<()>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _ = read_http_request(&mut stream);
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"id\":",
-            );
-            let _ = stream.flush();
-            std::thread::sleep(std::time::Duration::from_secs(3));
-        });
-        (base, handle)
-    }
-
-    fn assert_receipt_removed(path: &std::path::Path) {
-        let end = std::time::Instant::now() + Duration::from_secs(1);
-        while path.exists() && std::time::Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(!path.exists(), "acknowledged stop must remove the receipt");
-    }
-
-    const TEST_BROWSER_ID: &str = "0e6ae5d0-93cf-4b9c-8c62-2c9c07b6c0f7";
-
-    #[test]
-    fn test_browser_use_cancellation_during_receipt_retains_allocated_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = browser_use_env(dir.path());
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let handle = rt.handle().clone();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let (release, blocked) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _ = read_http_request(&mut stream);
-            let (started, running) = std::sync::mpsc::channel();
-            handle.spawn_blocking(move || {
-                started.send(()).unwrap();
-                let _ = blocked.recv_timeout(Duration::from_secs(3));
-            });
-            running.recv_timeout(Duration::from_secs(1)).unwrap();
-            let body = format!(
-                r#"{{"id":"{}","cdpUrl":"ws://127.0.0.1:1"}}"#,
-                TEST_BROWSER_ID
-            );
-            stream
-                .write_all(http_response("201 Created", &body).as_bytes())
-                .unwrap();
-        });
-        let mut owned = None;
-        let timed_out = rt.block_on(async {
-            tokio::time::timeout(
-                Duration::from_millis(500),
-                connect_browser_use_at_with_owner(
-                    &base,
-                    Duration::from_secs(2),
-                    Duration::from_secs(2),
-                    |session| {
-                        owned = session;
-                    },
-                ),
-            )
-            .await
-            .is_err()
-        });
-        release.send(()).unwrap();
-        server.join().unwrap();
-        assert!(
-            timed_out,
-            "receipt write must be awaiting the blocked filesystem worker"
-        );
-        assert_eq!(owned.unwrap().session_id, TEST_BROWSER_ID);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_browser_use_unwritable_existing_storage_prevents_create() {
-        use std::os::unix::fs::PermissionsExt;
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = browser_use_env(dir.path());
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(connect_browser_use_at(
+    #[tokio::test]
+    async fn test_browser_use_v4_protocol() {
+        let guard = browser_use_env();
+        guard.set("BROWSER_USE_PROFILE_ID", "profile-123");
+        guard.set("BROWSER_USE_PROXY_COUNTRY", "DE");
+        guard.set("BROWSER_USE_ENABLE_RECORDING", "true");
+        for endpoint in [
+            "wss://example.com/cdp",
+            "https://example.com",
+            "ws://127.0.0.1:1",
             "http://127.0.0.1:1",
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-        ));
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(result.unwrap_err().contains("storage is not writable"));
-    }
-
-    #[test]
-    fn test_browser_use_uuid_shaped_credential_is_not_reflected() {
-        let dir = tempfile::tempdir().unwrap();
-        let guard = browser_use_env(dir.path());
-        guard.set("BROWSER_USE_API_KEY", TEST_BROWSER_ID);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let body = format!(
-            r#"{{"id":"{}","cdpUrl":"ws://127.0.0.1:1"}}"#,
-            TEST_BROWSER_ID.to_uppercase()
-        );
-        let (base, server) = serve_responses(vec![http_response("201 Created", &body)]);
-        let error = rt
-            .block_on(connect_browser_use_at(
-                &base,
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-            ))
-            .unwrap_err();
-        server.join().unwrap();
-        assert!(!error.to_lowercase().contains(TEST_BROWSER_ID));
-        assert!(
-            !browser_use_receipt_path(&uuid::Uuid::parse_str(TEST_BROWSER_ID).unwrap()).exists()
-        );
-    }
-
-    #[test]
-    fn test_browser_use_deadlines_are_fixed() {
-        assert_eq!(BROWSER_USE_CREATE_DEADLINE, Duration::from_secs(10));
-        assert_eq!(BROWSER_USE_STOP_DEADLINE, Duration::from_secs(4));
-        assert_eq!(BROWSER_USE_API_BASE, "https://api.browser-use.com/api/v4");
-    }
-
-    #[test]
-    fn test_browser_use_receipt_contents_are_safe() {
-        let id = uuid::Uuid::parse_str(TEST_BROWSER_ID).unwrap();
-        let contents = browser_use_receipt_contents(&id);
-        assert!(contents.contains(TEST_BROWSER_ID));
-        assert!(contents.contains("browser-use"));
-        assert!(contents.contains("action"));
-        assert!(!contents.contains("test-key-do-not-echo"));
-        assert!(!contents.contains("cdpUrl"));
-    }
-
-    #[test]
-    fn test_browser_use_create_success_writes_receipt_and_stop_removes_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = browser_use_env(dir.path());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
-        let create_body = format!(
-            r#"{{"id":"{}","status":"active","cdpUrl":"ws://127.0.0.1:1/devtools/browser/x"}}"#,
-            TEST_BROWSER_ID
-        );
-        let (base, server) = serve_responses(vec![http_response("200 OK", &create_body)]);
-        let (ws_url, session) = rt
-            .block_on(connect_browser_use_at(
-                &base,
-                Duration::from_secs(2),
-                Duration::from_secs(2),
-            ))
-            .unwrap();
-        let requests = server.join().unwrap();
-        assert!(requests[0].starts_with("POST /browsers HTTP/1.1"));
-        assert_eq!(ws_url, "ws://127.0.0.1:1/devtools/browser/x");
-        let session = session.unwrap();
-        assert_eq!(session.provider, "browser-use");
-        assert_eq!(session.session_id, TEST_BROWSER_ID);
-
-        let id = uuid::Uuid::parse_str(TEST_BROWSER_ID).unwrap();
-        let receipt = browser_use_receipt_path(&id);
-        let contents = std::fs::read_to_string(&receipt).unwrap();
-        assert!(contents.contains(TEST_BROWSER_ID));
-        assert!(!contents.contains("test-key-do-not-echo"));
-
-        let stop_body = format!(r#"{{"id":"{}","status":"stopped"}}"#, TEST_BROWSER_ID);
-        let (base, server) = serve_responses(vec![http_response("200 OK", &stop_body)]);
-        rt.block_on(stop_browser_use_session_at(
-            &base,
-            TEST_BROWSER_ID,
-            Duration::from_secs(2),
-        ))
-        .unwrap();
-        let requests = server.join().unwrap();
-        assert!(requests[0].starts_with(&format!("PATCH /browsers/{} HTTP/1.1", TEST_BROWSER_ID)));
-        assert!(requests[0].contains(r#"{"action":"stop"}"#));
-        assert_receipt_removed(&receipt);
-    }
-
-    #[test]
-    fn test_browser_use_accepts_http_cdp_endpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = browser_use_env(dir.path());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let body = format!(
-            r#"{{"id":"{}","cdpUrl":"http://127.0.0.1:9222"}}"#,
-            TEST_BROWSER_ID
-        );
-        let (base, server) = serve_responses(vec![http_response("201 Created", &body)]);
-        let (endpoint, session) = rt
-            .block_on(connect_browser_use_at(
-                &base,
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-            ))
-            .unwrap();
-        server.join().unwrap();
-        assert_eq!(endpoint, "http://127.0.0.1:9222");
-        assert_eq!(session.unwrap().session_id, TEST_BROWSER_ID);
-    }
-
-    #[test]
-    fn test_browser_use_create_failures_are_safe_and_leave_no_receipt() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = browser_use_env(dir.path());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
-        let cases = vec![
-            (
-                http_response(
-                    "500 Internal Server Error",
-                    r#"{"detail":"hostile-secret-body"}"#,
-                ),
-                vec!["status 500"],
-                vec!["hostile-secret-body"],
-            ),
-            (
-                http_response("200 OK", "this is not json"),
-                vec!["invalid create response", "inspect Browser Use Cloud"],
-                vec!["this is not json"],
-            ),
-            (
-                http_response("200 OK", r#"{"cdpUrl":"ws://127.0.0.1:1/x"}"#),
-                vec!["valid browser id", "inspect Browser Use Cloud"],
-                vec![],
-            ),
-            (
-                http_response("200 OK", r#"{"id":"../../etc/passwd","cdpUrl":"ws://x"}"#),
-                vec!["valid browser id"],
-                vec!["etc/passwd"],
-            ),
-        ];
-        for (response, expected, forbidden) in cases {
-            let (base, server) = serve_responses(vec![response]);
-            let error = rt
-                .block_on(connect_browser_use_at(
-                    &base,
-                    Duration::from_secs(2),
-                    Duration::from_secs(2),
-                ))
-                .unwrap_err();
-            server.join().unwrap();
-            for fragment in expected {
-                assert!(
-                    error.contains(fragment),
-                    "{:?} missing in {:?}",
-                    fragment,
-                    error
-                );
-            }
-            for fragment in forbidden {
-                assert!(
-                    !error.contains(fragment),
-                    "{:?} leaked in {:?}",
-                    fragment,
-                    error
-                );
-            }
-            assert!(!error.contains("test-key-do-not-echo"));
-        }
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn test_browser_use_create_body_stall_is_bounded() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = browser_use_env(dir.path());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
-        let (base, server) = serve_stalled_body();
-        let started = std::time::Instant::now();
-        let error = rt
-            .block_on(connect_browser_use_at(
-                &base,
-                Duration::from_millis(500),
-                Duration::from_millis(500),
-            ))
-            .unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(
-            error.contains("stalled") || error.contains("timed out"),
-            "{error}"
-        );
-        assert!(error.contains("inspect Browser Use Cloud"));
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn test_browser_use_null_cdp_url_triggers_bounded_rollback() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = browser_use_env(dir.path());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let id = uuid::Uuid::parse_str(TEST_BROWSER_ID).unwrap();
-
-        let create_body = format!(r#"{{"id":"{}","cdpUrl":null}}"#, TEST_BROWSER_ID);
-        let stop_body = format!(r#"{{"id":"{}","status":"stopped"}}"#, TEST_BROWSER_ID);
-        let (base, server) = serve_responses(vec![
-            http_response("200 OK", &create_body),
-            http_response("200 OK", &stop_body),
-        ]);
-        let error = rt
-            .block_on(connect_browser_use_at(
-                &base,
-                Duration::from_secs(2),
-                Duration::from_secs(2),
-            ))
-            .unwrap_err();
-        let requests = server.join().unwrap();
-        assert!(requests[1].starts_with(&format!("PATCH /browsers/{} HTTP/1.1", TEST_BROWSER_ID)));
-        assert!(error.contains("cdpUrl"));
-        assert!(error.contains("was stopped"));
-        assert_receipt_removed(&browser_use_receipt_path(&id));
-
-        let (base, server) = serve_responses(vec![
-            http_response("200 OK", &create_body),
-            http_response("500 Internal Server Error", "{}"),
-        ]);
-        let error = rt
-            .block_on(connect_browser_use_at(
-                &base,
-                Duration::from_secs(2),
-                Duration::from_secs(2),
-            ))
-            .unwrap_err();
-        server.join().unwrap();
-        assert!(error.contains(TEST_BROWSER_ID));
-        assert!(error.contains("rollback failed"));
-        assert!(browser_use_receipt_path(&id).exists());
-    }
-
-    #[test]
-    fn test_browser_use_stop_acknowledgment_matrix() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = browser_use_env(dir.path());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let id = uuid::Uuid::parse_str(TEST_BROWSER_ID).unwrap();
-
-        let cases = vec![
-            (
-                http_response(
-                    "200 OK",
-                    r#"{"id":"11111111-1111-4111-8111-111111111111","status":"stopped"}"#,
-                ),
-                "did not acknowledge",
-            ),
-            (
-                http_response(
-                    "200 OK",
-                    &format!(r#"{{"id":"{}","status":"active"}}"#, TEST_BROWSER_ID),
-                ),
-                "did not acknowledge",
-            ),
-            (http_response("200 OK", "not json"), "did not acknowledge"),
-            (http_response("404 Not Found", "{}"), "status 404"),
-            (
-                http_response(
-                    "500 Internal Server Error",
-                    r#"{"detail":"hostile-secret-body"}"#,
-                ),
-                "status 500",
-            ),
-        ];
-        for (response, expected) in cases {
-            std::fs::write(browser_use_receipt_path(&id), "receipt").unwrap();
-            let (base, server) = serve_responses(vec![response]);
-            let error = rt
-                .block_on(stop_browser_use_session_at(
-                    &base,
-                    TEST_BROWSER_ID,
-                    Duration::from_secs(2),
-                ))
-                .unwrap_err();
-            server.join().unwrap();
-            assert!(
-                error.contains(expected),
-                "{:?} missing in {:?}",
-                expected,
-                error
+            "",
+        ] {
+            let body = json!({"id":TEST_BROWSER_ID,"cdpUrl":endpoint});
+            let (base, server) = browser_use_server(201, &body.to_string(), false);
+            let (url, session) = connect_browser_use_at(&base, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(url, endpoint);
+            assert_eq!(session.unwrap().session_id, TEST_BROWSER_ID);
+            let request = server.join().unwrap();
+            assert!(request.starts_with("POST /browsers HTTP/1.1"));
+            assert!(request
+                .to_lowercase()
+                .contains("x-browser-use-api-key: test-key-do-not-echo"));
+            let body: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                body,
+                json!({"profileId":"profile-123","proxyCountryCode":"de","enableRecording":true})
             );
-            assert!(error.contains(TEST_BROWSER_ID));
-            assert!(!error.contains("hostile-secret-body"));
-            assert!(!error.contains("test-key-do-not-echo"));
-            assert!(browser_use_receipt_path(&id).exists());
+        }
+        for (input, expected) in [
+            (None, json!({})),
+            (Some("direct"), json!({"proxyCountryCode":null})),
+            (Some("none"), json!({"proxyCountryCode":null})),
+        ] {
+            assert_eq!(
+                browser_use_create_body_from_lookup(|name| (name == "BROWSER_USE_PROXY_COUNTRY")
+                    .then(|| input.map(str::to_string))
+                    .flatten()),
+                expected
+            );
+        }
+        for (status, body, success) in [
+            (
+                200,
+                json!({"id":TEST_BROWSER_ID,"status":"stopped"}).to_string(),
+                true,
+            ),
+            (
+                200,
+                json!({"id":TEST_BROWSER_ID,"status":"active"}).to_string(),
+                false,
+            ),
+            (
+                200,
+                json!({"id":uuid::Uuid::nil().to_string(),"status":"stopped"}).to_string(),
+                false,
+            ),
+            (200, "not json".to_string(), false),
+            (404, "hostile-secret-body".to_string(), false),
+            (500, "hostile-secret-body".to_string(), false),
+        ] {
+            let (base, server) = browser_use_server(status, &body, false);
+            let result =
+                stop_browser_use_session_at(&base, TEST_BROWSER_ID, Duration::from_secs(2)).await;
+            assert_eq!(result.is_ok(), success, "{result:?}");
+            if let Err(error) = result {
+                assert!(error.contains(TEST_BROWSER_ID));
+                assert!(
+                    !error.contains("hostile-secret-body")
+                        && !error.contains("test-key-do-not-echo")
+                );
+            }
+            let request = server.join().unwrap();
+            assert!(request.starts_with(&format!("PATCH /browsers/{TEST_BROWSER_ID} HTTP/1.1")));
+            assert!(request.ends_with(r#"{"action":"stop"}"#));
         }
     }
 
-    #[test]
-    fn test_browser_use_stop_precondition_failures() {
-        let dir = tempfile::tempdir().unwrap();
-        let guard = browser_use_env(dir.path());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
-        let error = rt
-            .block_on(stop_browser_use_session_at(
-                "http://127.0.0.1:1",
-                "../../etc/passwd",
-                Duration::from_millis(200),
-            ))
-            .unwrap_err();
-        assert!(error.contains("not a valid UUID"));
-        assert!(!error.contains("etc/passwd"));
-
-        guard.remove("BROWSER_USE_API_KEY");
-        let error = rt
-            .block_on(stop_browser_use_session_at(
-                "http://127.0.0.1:1",
-                TEST_BROWSER_ID,
-                Duration::from_millis(200),
-            ))
-            .unwrap_err();
-        assert!(error.contains("BROWSER_USE_API_KEY"));
-        assert!(error.contains(TEST_BROWSER_ID));
-        assert!(error.contains("was not stopped"));
-    }
-
-    #[test]
-    fn test_browser_use_v4_options_and_response() {
-        let values = std::collections::HashMap::from([
-            ("BROWSER_USE_PROFILE_ID", "profile-123"),
-            ("BROWSER_USE_PROXY_COUNTRY", "DE"),
-            ("BROWSER_USE_ENABLE_RECORDING", "true"),
-        ]);
-        let body = browser_use_create_body_from_lookup(|name| {
-            values.get(name).map(|value| (*value).to_string())
-        });
-        assert_eq!(
-            body,
-            json!({
-                "profileId": "profile-123",
-                "proxyCountryCode": "de",
-                "enableRecording": true,
-            })
+    #[tokio::test]
+    async fn test_browser_use_rejects_invalid_identity_without_exposing_secrets() {
+        let guard = browser_use_env();
+        for (status, body) in [
+            (500, "secret-response"),
+            (200, "not-json"),
+            (200, r#"{"cdpUrl":"ws://secret"}"#),
+            (200, r#"{"id":"../secret"}"#),
+        ] {
+            let (base, server) = browser_use_server(status, body, false);
+            let error = connect_browser_use_at(&base, Duration::from_secs(2))
+                .await
+                .unwrap_err();
+            assert!(error.contains("inspect Browser Use Cloud"));
+            assert!(!error.contains("secret") && !error.contains("test-key-do-not-echo"));
+            server.join().unwrap();
+        }
+        guard.set("BROWSER_USE_API_KEY", TEST_BROWSER_ID);
+        let (base, server) = browser_use_server(
+            201,
+            &json!({"id":TEST_BROWSER_ID.to_uppercase()}).to_string(),
+            false,
         );
-        assert!(body.get("customProxy").is_none());
+        let error = connect_browser_use_at(&base, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(!error.to_lowercase().contains(TEST_BROWSER_ID));
+        server.join().unwrap();
+        guard.remove("BROWSER_USE_API_KEY");
+        for id in ["../secret", TEST_BROWSER_ID] {
+            let error =
+                stop_browser_use_session_at("http://127.0.0.1:1", id, Duration::from_secs(1))
+                    .await
+                    .unwrap_err();
+            assert!(!error.contains("secret"));
+        }
     }
 
-    #[test]
-    fn test_browser_use_managed_proxy_can_be_disabled() {
-        let body = browser_use_create_body_from_lookup(|name| {
-            (name == "BROWSER_USE_PROXY_COUNTRY").then(|| "direct".to_string())
-        });
-        assert_eq!(body, json!({ "proxyCountryCode": null }));
+    #[tokio::test]
+    async fn test_browser_use_create_and_stop_body_deadlines() {
+        let _guard = browser_use_env();
+        for create in [true, false] {
+            let (base, server) = browser_use_server(200, "{", true);
+            let deadline = Duration::from_millis(50);
+            let started = std::time::Instant::now();
+            let result = if create {
+                connect_browser_use_at(&base, deadline).await.map(|_| ())
+            } else {
+                stop_browser_use_session_at(&base, TEST_BROWSER_ID, deadline).await
+            };
+            assert!(result.unwrap_err().contains("timed out"));
+            assert!(started.elapsed() < Duration::from_millis(400));
+            server.join().unwrap();
+        }
     }
 
     #[test]

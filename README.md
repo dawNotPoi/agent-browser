@@ -1958,7 +1958,7 @@ The Cloud browser stays active between commands. Run `agent-browser close` when 
 
 `close` succeeds only after Browser Use acknowledges the browser as stopped. On a failed stop, `close` returns an error and keeps the session id, so running `agent-browser close` again retries the same browser, and a new launch is blocked until the pending browser is released.
 
-Before attaching, agent-browser writes a recovery receipt to `<socket dir>/browser-use-<id>.receipt` (the socket directory is shown by `agent-browser session info`, typically `~/.agent-browser/`). The receipt contains only the browser id and manual stop instructions, never your API key. Removal after an acknowledged stop is best effort. If a receipt remains after the daemon exits, verify the browser status in Cloud before stopping it or deleting the receipt.
+If the daemon exits before a stop succeeds, inspect the Browser Use Cloud dashboard and stop the browser there.
 
 If a stop keeps returning 404, verify the browser status in Browser Use Cloud. After confirming it has stopped, use a new `--session` name to continue; agent-browser does not treat 404 as proof of a successful stop.
 
