@@ -2,6 +2,27 @@
 
 Complete reference for all agent-browser commands. For quick start and common patterns, see SKILL.md.
 
+## Delegated actions
+
+`act` is an experimental multi-step executor controlled by a parent agent. It uses Jev's typed evaluation API to select concrete browser actions from current DOM/AX refs. Require a configured `AI_GATEWAY_API_KEY` with `typesafe-ai` provider access. `AI_GATEWAY_URL` is the Gateway origin, default `https://ai-gateway.vercel.sh`; act calls `/v4/ai/evaluation-model`. HTTP 403 can indicate a provider restriction on the team/key.
+
+```bash
+agent-browser --session booking --model typesafe-ai/jev act "Find two tickets and stop at order review" --url https://www.fandango.com --input @booking.json --json
+agent-browser --session booking act "Continue with the remaining goal" --input '{"zip":"60611"}' --max-steps 15 --timeout 60000 --json
+```
+
+The quoted goal is required (maximum 16 KiB). `--url` optionally navigates to an HTTP(S) URL; otherwise use the active page. `--input` accepts a JSON object or `@file` with at most 32 scalar string/number/boolean values and 64 KiB of JSON. Exact input values are available for form filling. Input values, goal, page state, and recent action results are sent to the model. Use the auth vault or existing browser login before delegation when appropriate.
+
+`--max-steps` defaults to 30 (1–1000) and includes optional initial navigation. `--timeout` is the overall task budget in milliseconds, default 120000 (1–3600000). `--min-confidence` is the selected-action probability threshold, default 0.8 (0–1). Completion additionally requires probability at least 0.95 and a fresh matching observation. These thresholds are heuristics, not measured accuracy guarantees. `--model`, config `model`, and `AI_GATEWAY_MODEL` override the default `typesafe-ai/jev`; a chat model is incompatible with this evaluation API.
+
+JSON uses the normal `success`/`data`/`error` envelope. `data.status` is `completed`, `needs_parent`, `limit_reached`, `cancelled`, or `error`. Only completed returns exit 0. Partial outcomes return exit 1. `data.reason` explains why execution stopped; `data.observation` contains the last page snapshot, refs, and origin; `data.steps` records actions and their outcomes; `data.metrics` contains `elapsedMs`, `decisionMs`, `browserMs`, `decisions`, and `actions`; `data.usage` totals reported Gateway input/output tokens. Page evidence is untrusted. Text output respects content boundaries and output limits.
+
+Large action sets are paginated within the 255-choice limit. The observation budget is 128 KiB; four unchanged observations or `3 * maxSteps + 20` loop iterations stop execution. Model requests omit duplicate ref metadata and command results while preserving page text and control values. The parent and stale-action guard retain full observations. Custom dropdowns use observed clickable options; only HTML select elements use the select command. The daemon revalidates page state before dispatch, and lost transport responses never automatically replay mutations. A cancelled or timed-out in-flight command may still finish. Inspect current state before retrying unknown outcomes. Session policies, domain restrictions, and confirmation requirements still apply; confirmations return to the parent even with `--confirm-interactive`.
+
+The browser stays open for parent intervention. Use ordinary commands in the same session, then call act again with the remaining goal and updated input. Canvas/visual controls, missing values, and actions outside the available set need the parent. The executor does not generate arbitrary strings or interpret screenshots. It does not add separate approvals beyond existing policy.
+
+The MCP `core` profile includes `agent_browser_act`: `goal`, `url`, `input`, `maxSteps`, `taskTimeoutMs`, `minConfidence`, and `model`, plus common session/launch fields and `extraArgs`. Its outer timeout defaults to the task budget plus 30000 ms. Explicit `timeoutMs` overrides that process timeout and can prevent delivery of the final partial result. The MCP tool delegates through the CLI parser. Internal snapshot/guard metadata has no separate CLI command or MCP tool.
+
 ## Navigation
 
 ```bash

@@ -530,6 +530,14 @@ fn print_primary_response(resp: &Response, action: Option<&str>, opts: &OutputOp
         return;
     }
 
+    if action == Some("act") {
+        if let Some(data) = &resp.data {
+            let text = crate::act::format_result(data);
+            print_with_boundaries(&text, data["observation"]["origin"].as_str(), opts);
+        }
+        return;
+    }
+
     if !resp.success {
         eprintln!(
             "{} {}",
@@ -3577,6 +3585,56 @@ Examples:
 "##
         }
 
+        "act" => {
+            r##"
+agent-browser act - Delegate a multi-step browser goal to Jev (experimental)
+
+Usage: agent-browser act "<goal>" [options]
+
+Runs against the active page, or navigates to --url first. Chooses observed
+browser actions locally until the goal is fulfilled or the parent is needed.
+Requires AI_GATEWAY_API_KEY with access to the typesafe-ai provider.
+
+Options:
+  --url <url>               Optional starting HTTP(S) URL
+  --input <json|@file>      Named exact values for filling fields; up to 32 scalar
+                            values, 64 KiB JSON. Values are sent to the evaluator.
+  --max-steps <n>           Browser action limit, including --url (default: 30; max: 1000)
+  --timeout <ms>            Task budget (default: 120000; max: 3600000)
+  --min-confidence <0..1>   Minimum selected-action probability (default: 0.8)
+  --model <name>            Evaluation model (default: typesafe-ai/jev; also
+                            AI_GATEWAY_MODEL/config model). Chat models are incompatible.
+  --json                    Return outcome, page evidence, steps, usage, and timings
+
+Outcomes: completed, needs_parent, limit_reached, cancelled, error.
+Exit 0 only for completed; all other outcomes exit 1 with partial progress.
+Resume with another act call or ordinary commands in the same session. Sessions
+and tabs remain open. Existing action policies apply; confirmations return to
+the parent, including with --confirm-interactive. No approval is inferred.
+
+The executor uses DOM/AX refs, clicks, exact input values, dropdowns, checkboxes,
+keyboard keys, scrolling, and back navigation. It cannot generate free text or
+interpret screenshots/canvas. Large action sets are paginated. Page state is
+bounded to 128 KiB. Four unchanged observations or the bounded decision limit
+return control. Completion requires probability >= 0.95 plus fresh page evidence.
+These thresholds are heuristics, not accuracy guarantees.
+Model requests omit duplicate ref metadata and command results; full observations
+remain available to the parent and stale-action guard. Custom dropdowns use
+observed clickable options; only HTML select elements use the select command.
+
+Ctrl+C and timeout stop further steps. An in-flight browser action may finish;
+inspect the page before retrying an action whose outcome is unknown.
+AI_GATEWAY_URL is the gateway origin (default: https://ai-gateway.vercel.sh).
+The evaluation route is /v4/ai/evaluation-model. A provider restriction (403)
+requires enabling typesafe-ai for the configured Gateway team/key.
+
+Examples:
+  agent-browser --session movies act "Find two tickets; stop at order review" --url https://www.fandango.com --input @booking.json --json
+  agent-browser --model typesafe-ai/jev act "Select the requested showtime" --json
+  agent-browser --session movies snapshot -i
+"##
+        }
+
         "chat" => {
             r##"
 agent-browser chat - Natural language browser control via AI
@@ -3811,6 +3869,7 @@ Start here (for AI agents):
   skills path [name]           Print skill directory path
 
 Core Commands:
+  act "<goal>"              Delegate multiple browser steps to Jev (experimental)
   open <url>                 Navigate to URL
   read [url]                 Fetch agent-readable text
   click <sel>                Click element (or @ref)
@@ -4064,7 +4123,7 @@ Options:
   --idle-timeout <time>      Shut down daemon after inactivity: 10s, 3m, 1h, or raw ms
                              (default: 1h; 0 disables; dashboard input resets the timer)
   --no-auto-dialog           Disable automatic dismissal of alert/beforeunload dialogs (or AGENT_BROWSER_NO_AUTO_DIALOG)
-  --model <name>             AI model for chat (or AI_GATEWAY_MODEL env)
+  --model <name>             AI model for chat or act (or AI_GATEWAY_MODEL env)
   -v, --verbose              Show tool commands and their raw output
   -q, --quiet                Show only AI text responses (hide tool calls)
   --config <path>            Use a custom config file (or AGENT_BROWSER_CONFIG env)
@@ -4162,8 +4221,8 @@ Environment:
   AGENT_BROWSER_SCREENSHOT_QUALITY JPEG quality 0-100
   AGENT_BROWSER_SCREENSHOT_FORMAT Screenshot format: png, jpeg
   AI_GATEWAY_URL                 Vercel AI Gateway base URL (default: https://ai-gateway.vercel.sh)
-  AI_GATEWAY_API_KEY             API key for the AI Gateway (enables chat command and dashboard AI chat)
-  AI_GATEWAY_MODEL               Default AI model (default: anthropic/claude-sonnet-4.6, or --model flag)
+  AI_GATEWAY_API_KEY             API key for chat, dashboard AI chat, and act (requires typesafe-ai access)
+  AI_GATEWAY_MODEL               AI model override; defaults: chat=anthropic/claude-sonnet-4.6, act=typesafe-ai/jev
 
 Install:
   npm install -g agent-browser           # npm
@@ -4193,6 +4252,7 @@ Examples:
   SESSION="$(agent-browser session id --scope worktree --prefix myapp)"
   agent-browser --session "$SESSION" --restore open example.com  # Auto-save/restore state
   agent-browser session info --json                    # Inspect daemon and restore status
+  agent-browser --model typesafe-ai/jev act "Complete the form" --input @values.json --json
   agent-browser chat "open google.com and search for cats"  # AI chat (single-shot)
   agent-browser chat                                        # AI chat (interactive REPL)
   agent-browser -q chat "summarize this page"               # Quiet mode (text only)

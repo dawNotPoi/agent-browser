@@ -504,6 +504,40 @@ agent-browser doctor --json              # Structured JSON output for agents
 
 Exit code is `0` if all checks pass (warnings are fine), `1` if any fail. See the [Installation page](/installation#doctor) for the full check catalog.
 
+## Delegated actions (experimental)
+
+Use `act` to delegate a multi-step browser goal to Jev in one parent-agent call. It observes the current page, selects among concrete actions on real refs, executes through the daemon, and repeats. Set `AI_GATEWAY_API_KEY` with `typesafe-ai` provider access. If Gateway returns HTTP 403, check the team/key's provider restrictions.
+
+```bash
+agent-browser --session movies --model typesafe-ai/jev act \
+  "Find two adult tickets for the requested movie tomorrow after 7pm. Choose adjacent seats; stop at order review." \
+  --url https://www.fandango.com --input @booking.json --json
+```
+
+The parent supplies preferences and exact values such as `{"movie":"Arrival","zip":"60611","count":2}` in `booking.json`. The goal, inputs, page content, and recent action results are sent to the evaluator. Page content remains untrusted. Without `--url`, execution starts on the active page.
+
+<table>
+  <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>--url &lt;url&gt;</code></td><td>Optional initial HTTP(S) navigation</td></tr>
+    <tr><td><code>--input &lt;json|@file&gt;</code></td><td>Up to 32 named scalar values; maximum 64 KiB JSON</td></tr>
+    <tr><td><code>--max-steps &lt;n&gt;</code></td><td>Browser actions including initial navigation; default 30, range 1–1000</td></tr>
+    <tr><td><code>--timeout &lt;ms&gt;</code></td><td>Task budget; default 120000, range 1–3600000</td></tr>
+    <tr><td><code>--min-confidence &lt;0..1&gt;</code></td><td>Minimum selected-action probability; default 0.8</td></tr>
+    <tr><td><code>--model &lt;name&gt;</code></td><td>Gateway evaluation model; default <code>typesafe-ai/jev</code></td></tr>
+  </tbody>
+</table>
+
+`AI_GATEWAY_MODEL` and config `model` also override the default; explicitly use `--model typesafe-ai/jev` if they select a chat model. Chat models do not support this evaluation endpoint. `AI_GATEWAY_URL` is the Gateway origin, default `https://ai-gateway.vercel.sh`, with evaluation requests sent to `/v4/ai/evaluation-model`.
+
+JSON returns the normal envelope with `data.status`, `data.reason`, `data.observation`, `data.steps`, `data.metrics`, and `data.usage`. Outcomes are `completed` (exit 0), or `needs_parent`, `limit_reached`, `cancelled`, and `error` (exit 1 with partial progress). Metrics separate elapsed, decision, and browser milliseconds and count decisions and actions. Token usage totals the Gateway reports. The browser stays open; the parent can inspect evidence, perform ordinary commands, and call act again with the remaining goal in the same session.
+
+The executor supports clicks, form filling with supplied values, dropdowns, checkboxes, keyboard keys, scrolling, and back navigation. It cannot generate arbitrary text or interpret a canvas seat map. Actions are paginated within Jev's 255-choice limit. Observations are bounded to 128 KiB. Model requests omit duplicate ref metadata and command results while preserving page text and control values; the parent and stale-action guard retain full observations. Custom dropdowns use observed clickable options; only HTML select elements use the select command. Four unchanged observations or `3 * maxSteps + 20` iterations stop the loop. The daemon checks page state before each selected action. Completion requires probability at least 0.95 and fresh matching page evidence; model probabilities remain fallible.
+
+Existing domain restrictions and action policies apply. Confirmation requests return to the parent, including with `--confirm-interactive`. Ctrl+C and timeout stop new steps, but an in-flight command may finish. Verify page state before retrying an unknown outcome. Text output respects content boundaries and output limits.
+
+The default MCP `core` profile includes `agent_browser_act`, with typed `goal`, `url`, `input`, `maxSteps`, `taskTimeoutMs`, `minConfidence`, and `model` arguments. It uses the CLI parser and response schema. Its process timeout defaults to the task budget plus 30 seconds; an explicit common `timeoutMs` can stop it earlier and omit the final partial response. Snapshot/guard transport metadata is internal to act and has no separate public command or tool.
+
 ## Chat
 
 Use natural language to control the browser via AI. The `chat` command translates instructions into agent-browser commands, executes them, and streams the AI response. Requires `AI_GATEWAY_API_KEY` to be set.
@@ -638,7 +672,7 @@ See [Init Scripts & Extensions](/init-scripts) for launch-time scripts, runtime 
 --input-mode <mode>      # Pointer movement: instant (default), smooth, human
 --idle-timeout <time>    # Auto-shutdown daemon after inactivity (default: 1h; 0 disables)
 --no-auto-dialog         # Disable auto-accept for alert and beforeunload dialogs
---model <name>           # AI model for chat (or AI_GATEWAY_MODEL env)
+--model <name>           # AI model for chat or act (or AI_GATEWAY_MODEL env)
 -v, --verbose            # Show tool commands and their raw output (chat)
 -q, --quiet              # Show only AI text responses (chat)
 --config <path>          # Use a custom config file

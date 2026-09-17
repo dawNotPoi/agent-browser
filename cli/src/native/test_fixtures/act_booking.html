@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Movie tickets</title>
+<style>
+  body { font: 18px system-ui; max-width: 700px; margin: 50px auto; }
+  label { display: block; margin: 15px 0; }
+  button, input, select { font: inherit; padding: 10px; margin: 6px; }
+  #error { color: #b00; }
+</style>
+<main></main>
+<script>
+const main = document.querySelector('main');
+const booking = window.booking = { movie: '', zip: '', showtime: '', count: 1, seats: [], reviewed: false };
+function search() {
+  main.innerHTML = '<h1>Find a movie</h1><form><label>Movie<input name="movie" required></label><label>ZIP<input name="zip" required pattern="[0-9]{5}"></label><button>Find showtimes</button></form>';
+  main.querySelector('form').onsubmit = event => {
+    event.preventDefault();
+    booking.movie = event.target.elements.movie.value;
+    booking.zip = event.target.elements.zip.value;
+    main.innerHTML = '<h1>Loading showtimes</h1><p>Please wait</p>';
+    setTimeout(showtimes, 100);
+  };
+}
+function showtimes() {
+  main.innerHTML = '<h1>Choose showtime</h1><p id="details"></p><button disabled>6:00pm sold out</button><button>7:15pm</button><button>9:30pm</button>';
+  document.querySelector('#details').textContent = `${booking.movie}, tomorrow at River Cinema, near ${booking.zip}`;
+  main.querySelectorAll('button:not(:disabled)').forEach(button => button.onclick = () => {
+    booking.showtime = button.textContent;
+    tickets();
+  });
+}
+function tickets() {
+  main.innerHTML = '<h1>Choose tickets</h1><label>Ticket count<select><option value="1">One adult</option><option value="2">Two adults</option><option value="3">Three adults</option><option value="4" disabled>Four adults unavailable</option></select></label><button>Continue to seats</button>';
+  main.querySelector('select').onchange = event => booking.count = Number(event.target.value);
+  main.querySelector('button').onclick = seats;
+}
+function seats() {
+  main.innerHTML = '<h1>Choose adjacent seats</h1><p>Rows B and C. Seats 3 and 4 in each row are adjacent.</p><div id="seats"></div><p id="error" role="alert"></p><button>Review order</button>';
+  for (const name of ['B3', 'B4', 'C3', 'C4']) {
+    const label = document.createElement('label');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.onchange = () => booking.seats = [...main.querySelectorAll('input:checked')].map(input => input.value);
+    input.value = name;
+    label.append(input, `Seat ${name}`);
+    document.querySelector('#seats').append(label);
+  }
+  main.querySelector('button').onclick = () => {
+    if (booking.seats.length !== booking.count) {
+      document.querySelector('#error').textContent = `Choose exactly ${booking.count} seats.`;
+      return;
+    }
+    booking.reviewed = true;
+    main.innerHTML = '<h1>Order review</h1><p id="summary"></p><p>No payment has been made.</p>';
+    document.querySelector('#summary').textContent = `${booking.count} adult tickets for ${booking.movie}, tomorrow at River Cinema near ${booking.zip}, ${booking.showtime}. Seats ${booking.seats.join(' and ')}. Total $${booking.count * 22}.`;
+  };
+}
+search();
+</script>

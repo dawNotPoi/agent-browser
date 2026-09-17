@@ -33,6 +33,20 @@ agent-browser snapshot -i       # 4. Re-snapshot after any page change
 
 Refs (`@e1`, `@e2`, ...) can be reused across snapshots. Take a fresh snapshot after navigation or to observe page changes.
 
+## Delegate multiple steps with act (experimental)
+
+When `AI_GATEWAY_API_KEY` has access to Jev, `act` can execute several browser steps within one tool call. Give it a goal with a clear stopping condition and supply exact form values as named input. Use a named session as described below. Keep the user's preferences and authorization in the parent agent's control.
+
+```bash
+agent-browser --session movies --model typesafe-ai/jev act \
+  "Find two tickets for the requested movie tomorrow after 7pm; stop at order review" \
+  --url https://www.fandango.com --input @booking.json --json
+```
+
+`booking.json` contains scalar values such as `{"movie":"Arrival","zip":"60611","count":2}`. The goal, inputs, and observed page are sent to the evaluation model. Use `--model typesafe-ai/jev` if your environment defaults to a chat model. Without `--url`, act uses the active page. It supports DOM/AX actions and supplied input values; it cannot generate free text or read a canvas seat map.
+
+Read `data.status` and the final evidence. Only `completed` exits 0. `needs_parent`, `limit_reached`, `cancelled`, and `error` exit 1 with partial progress. On handoff, inspect `data.observation` and `data.steps`, perform any necessary ordinary browser actions, and invoke act again in the same session with the remaining goal. Do not blindly repeat a mutation whose outcome is unknown. Confirmations are returned to the parent under the existing policy. The browser remains open. Model requests are compact, while the parent receives full observations. Both native selects and custom dropdowns with clickable options are supported. See [the act reference](references/commands.md#delegated-actions) for budgets, results, and MCP fields.
+
 ## Always use your own session
 
 Before your first command, set a named session for the whole task:

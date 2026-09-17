@@ -2532,6 +2532,11 @@ fn policy_actions_for_command(
     needs_implicit_launch: bool,
 ) -> Vec<String> {
     let mut actions = vec![action.to_string()];
+    if cmd.get("actGuard").is_some() {
+        // The guarded mutation also reads a fresh snapshot. Keep that read
+        // subject to a policy reloaded since the preceding observation.
+        actions.push("snapshot".to_string());
+    }
     // `a11y <url>` performs a real browser navigation before the audit. Keep
     // navigation deny and confirmation policies effective for the compound
     // command instead of treating it as a read-only audit.
@@ -2898,6 +2903,17 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     dialog.dialog_type, dialog.message, action
                 ),
             );
+        }
+    }
+
+    if let Some(expected) = cmd.get("actGuard").and_then(Value::as_str) {
+        let observed = handle_snapshot(&json!({"actObservation": true}), state).await;
+        match observed {
+            Ok(value) if value["fingerprint"].as_str() == Some(expected) => {}
+            Ok(_) => {
+                return json!({"id": id, "success": false, "code": "act_state_changed", "error": "Page changed after act observation; action was not executed"})
+            }
+            Err(err) => return error_response(&id, &err),
         }
     }
 
@@ -5590,9 +5606,27 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             let mut obj = serde_json::Map::new();
             obj.insert("role".into(), Value::String(entry.role));
             obj.insert("name".into(), Value::String(entry.name));
+            if cmd.get("actObservation").and_then(Value::as_bool) == Some(true) {
+                obj.insert("state".into(), entry.act_state);
+            }
             (ref_id, Value::Object(obj))
         })
         .collect();
+
+    // Private transport metadata for act. Bind the decision to the observed
+    // page and AX state; guarded actions revalidate under the daemon state lock.
+    if cmd.get("actObservation").and_then(Value::as_bool) == Some(true) {
+        use sha2::{Digest, Sha256};
+        let observation = json!({
+            "snapshot": tree, "origin": url, "refs": refs,
+            "targetId": mgr.active_target_id()?,
+            "frameId": state.active_frame_id,
+        });
+        let fingerprint = format!("{:x}", Sha256::digest(observation.to_string().as_bytes()));
+        let mut observation = observation;
+        observation["fingerprint"] = json!(fingerprint);
+        return Ok(observation);
+    }
 
     let current_refs = state.ref_map.ref_ids();
     let mut removed_refs = previous_refs

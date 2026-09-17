@@ -1125,6 +1125,44 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
     serde_json::from_str(&response_line).map_err(|e| format!("Invalid response: {}", e))
 }
 
+/// Send exactly once for act. An EOF/timeout after a write has an unknown
+/// outcome and must never cause a browser mutation to be automatically replayed.
+/// Cancellation drops the socket and stops the caller scheduling further steps;
+/// a browser command already in flight may still finish in the daemon.
+pub async fn send_act_command(
+    cmd: &Value,
+    session: &str,
+    timeout: Duration,
+) -> Result<Response, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let operation = async {
+        #[cfg(unix)]
+        let mut stream = tokio::net::UnixStream::connect(get_socket_path(session))
+            .await
+            .map_err(|e| format!("Failed to connect: {e}"))?;
+        #[cfg(windows)]
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", resolve_port(session)))
+            .await
+            .map_err(|e| format!("Failed to connect: {e}"))?;
+        let mut bytes = serde_json::to_vec(cmd).map_err(|e| e.to_string())?;
+        bytes.push(b'\n');
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|_| "Command transport failed; outcome unknown".to_string())?;
+        let mut line = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .map_err(|_| "Command response lost; outcome unknown".to_string())?;
+        serde_json::from_str(&line)
+            .map_err(|_| "Invalid command response; outcome unknown".to_string())
+    };
+    tokio::time::timeout(timeout, operation)
+        .await
+        .map_err(|_| "Command timed out; outcome unknown".to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

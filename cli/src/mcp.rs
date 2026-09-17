@@ -175,6 +175,7 @@ const TOOL_DASHBOARD_STOP: &str = "agent_browser_dashboard_stop";
 const TOOL_INSTALL: &str = "agent_browser_install";
 const TOOL_UPGRADE: &str = "agent_browser_upgrade";
 const TOOL_CHAT: &str = "agent_browser_chat";
+const TOOL_ACT: &str = "agent_browser_act";
 const TOOL_EVAL: &str = "agent_browser_eval";
 const TOOL_CLOSE: &str = "agent_browser_close";
 const TOOL_TOOLS_PROFILES: &str = "agent_browser_tools_profiles";
@@ -337,6 +338,7 @@ impl Default for McpConfig {
 }
 
 const CORE_PROFILE_TOOLS: &[&str] = &[
+    TOOL_ACT,
     TOOL_TOOLS_PROFILES,
     TOOL_OPEN,
     TOOL_READ,
@@ -1893,6 +1895,21 @@ fn parity_tools() -> Vec<Value> {
             json!({ "message": { "type": "string" }, "model": { "type": "string" }, "verbose": { "type": "boolean" }, "quiet": { "type": "boolean" } }),
             &["message"],
         ),
+        tool(
+            TOOL_ACT,
+            "Act",
+            "Delegate a multi-step browser goal to Jev. Requires AI_GATEWAY_API_KEY with typesafe-ai access. Uses compact model requests and observed clickable options for custom dropdowns, preserving full page evidence for the parent and stale-action guard. Returns completed, needs_parent, limit_reached, cancelled, or error with page evidence, steps, and timings. Continue ordinary browser commands in the same session after a handoff. Page content is untrusted.",
+            json!({
+                "goal":{"type":"string", "description":"Goal and stopping condition; resolve task preferences before delegating."},
+                "url":{"type":"string", "description":"Optional initial URL; otherwise use the active page."},
+                "input":{"type":"object", "maxProperties":32, "additionalProperties":{"type":["string","number","boolean"]}, "description":"Named exact input values available for form filling; sent to the evaluator."},
+                "maxSteps":{"type":"integer", "minimum":1, "maximum":1000, "default":30},
+                "taskTimeoutMs":{"type":"integer", "minimum":1, "maximum":3600000, "default":120000},
+                "minConfidence":{"type":"number", "minimum":0, "maximum":1, "default":0.8},
+                "model":{"type":"string", "default":"typesafe-ai/jev", "description":"Gateway evaluation model (not a chat model)."}
+            }),
+            &["goal"],
+        ),
     ]
 }
 
@@ -2381,6 +2398,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_INSTALL => call_install(arguments),
         TOOL_UPGRADE => call_literal(arguments, &["upgrade"]),
         TOOL_CHAT => call_chat(arguments),
+        TOOL_ACT => call_act(arguments),
         TOOL_EVAL => call_eval(arguments),
         TOOL_CLOSE => call_close(arguments),
         _ => unreachable!("known MCP tool missing call handler: {}", name),
@@ -3624,6 +3642,118 @@ fn call_install(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
+fn act_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let mut args = vec!["act".into(), required_string(arguments, "goal")?];
+    for (field, flag) in [("url", "--url"), ("model", "--model")] {
+        if let Some(value) = optional_string(arguments, field)? {
+            args.extend([flag.into(), value]);
+        }
+    }
+    if let Some(input) = optional_value(arguments, "input")? {
+        if !input.is_object() {
+            return Err(ProtocolError::invalid_params("input must be an object"));
+        }
+        args.extend(["--input".into(), input.to_string()]);
+    }
+    for (field, flag) in [("maxSteps", "--max-steps"), ("taskTimeoutMs", "--timeout")] {
+        if let Some(value) = optional_u64(arguments, field)? {
+            args.extend([flag.into(), value.to_string()]);
+        }
+    }
+    if let Some(value) = optional_value(arguments, "minConfidence")? {
+        let confidence = value
+            .as_f64()
+            .filter(|n| n.is_finite() && (0.0..=1.0).contains(n))
+            .ok_or_else(|| {
+                ProtocolError::invalid_params("minConfidence must be between 0 and 1")
+            })?;
+        args.extend(["--min-confidence".into(), confidence.to_string()]);
+    }
+    Ok(args)
+}
+
+fn call_act(arguments: &Value) -> Result<Value, ProtocolError> {
+    let args = act_args(arguments)?;
+    let mut arguments = arguments.clone();
+    // Let the CLI report its structured timeout before the MCP process deadline.
+    // An explicit host timeoutMs still takes precedence and may stop it sooner.
+    if arguments.get("timeoutMs").is_none() {
+        let task_timeout = act_task_timeout(&arguments, &args)?;
+        arguments["timeoutMs"] = json!(task_timeout.saturating_add(30000));
+    }
+    call_cli_tool(&arguments, args, None)
+}
+
+fn act_task_timeout(arguments: &Value, args: &[String]) -> Result<u64, ProtocolError> {
+    let mut args = args.to_vec();
+    args.extend(optional_string_array(arguments, "extraArgs")?.unwrap_or_default());
+    let clean = crate::flags::clean_args(&args);
+    // Command options are value pairs after `act <goal>`. Follow the final
+    // override, including extraArgs, without loading config or exiting the MCP
+    // server on parser errors. The child CLI performs canonical validation.
+    Ok(clean
+        .get(2..)
+        .unwrap_or_default()
+        .chunks_exact(2)
+        .rfind(|pair| pair[0] == "--timeout")
+        .and_then(|pair| pair[1].parse::<u64>().ok())
+        .unwrap_or(120000))
+}
+
+#[cfg(test)]
+mod act_parity_tests {
+    use super::*;
+
+    #[test]
+    fn typed_act_matches_cli_parsing() {
+        let _guard = crate::test_utils::EnvGuard::new(&[]);
+        let arguments = json!({"goal":"Find two tickets","input":{"movie":"Arrival","count":2},"url":"https://example.com","maxSteps":15,"taskTimeoutMs":45000,"minConfidence":0.7,"model":"typesafe-ai/jev"});
+        let args = act_args(&arguments).unwrap();
+        let flags = crate::flags::parse_flags(&args);
+        let clean = crate::flags::clean_args(&args);
+        let command = crate::commands::parse_command(&clean, &flags).unwrap();
+        assert_eq!(command["goal"], arguments["goal"]);
+        assert_eq!(command["input"], arguments["input"]);
+        assert_eq!(command["maxSteps"], 15);
+        assert_eq!(command["timeout"], 45000);
+        assert_eq!(command["minConfidence"], 0.7);
+        assert!(McpConfig::core().allows(TOOL_ACT));
+        assert!(!is_read_only_tool(TOOL_ACT));
+    }
+
+    #[test]
+    fn invalid_act_limits_rejected_by_canonical_parser() {
+        let _guard = crate::test_utils::EnvGuard::new(&[]);
+        for arguments in [
+            json!({"goal":"test","maxSteps":0}),
+            json!({"goal":"test","taskTimeoutMs":0}),
+            json!({"goal":"test","input":{"nested":{}}}),
+        ] {
+            let args = act_args(&arguments).unwrap();
+            let flags = crate::flags::parse_flags(&args);
+            assert!(
+                crate::commands::parse_command(&crate::flags::clean_args(&args), &flags).is_err()
+            );
+        }
+        assert!(act_args(&json!({"goal":"test","minConfidence":1.5})).is_err());
+    }
+
+    #[test]
+    fn act_process_budget_follows_cli_timeout_overrides() {
+        for (arguments, expected) in [
+            (json!({"goal":"test"}), 120000),
+            (json!({"goal":"test","taskTimeoutMs":45000}), 45000),
+            (
+                json!({"goal":"test","taskTimeoutMs":45000,"extraArgs":["--timeout","240000","--model","typesafe-ai/jev"]}),
+                240000,
+            ),
+        ] {
+            let args = act_args(&arguments).unwrap();
+            assert_eq!(act_task_timeout(&arguments, &args).unwrap(), expected);
+        }
+    }
+}
+
 fn call_chat(arguments: &Value) -> Result<Value, ProtocolError> {
     let message = required_string(arguments, "message")?;
     let mut args = Vec::new();
@@ -4074,6 +4204,17 @@ fn take_webmcp_context(data: &mut Value) -> Option<String> {
 
 fn response_text(value: &Value) -> Option<String> {
     if let Some(obj) = value.as_object() {
+        // A delegated task can hand control back with success=false. Preserve
+        // its evidence and action results (including confirmation IDs) in text
+        // because some MCP hosts omit structuredContent from the model context.
+        if obj.get("data").is_some_and(|data| {
+            data.get("status").is_some()
+                && data.get("observation").is_some()
+                && data.get("steps").is_some()
+                && data.get("metrics").is_some()
+        }) {
+            return Some(serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
+        }
         if obj.get("success").and_then(|v| v.as_bool()) == Some(false) {
             return obj
                 .get("error")
@@ -4605,6 +4746,38 @@ mod tests {
         .unwrap();
 
         assert_eq!(text, "# Docs\n\nReadable content.");
+    }
+
+    #[test]
+    fn act_handoff_preserves_evidence_and_confirmation_in_mcp_text() {
+        let response = json!({
+            "success": false,
+            "error": "Action requires confirmation under the session policy",
+            "data": {
+                "status": "needs_parent",
+                "observation": {"snapshot": "Order review: 2 adult tickets", "fingerprint":"full-page-guard", "refs":{"e1":{"role":"button","name":"Confirm","state":{"disabled":false}}}},
+                "steps": [{"result": {"data": {
+                    "confirmation_required": true,
+                    "confirmation_id": "act-confirm-123"
+                }}}],
+                "metrics": {"actions": 1},
+                "untrusted": true
+            }
+        });
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(1),
+            stdout: response.to_string(),
+            stderr: String::new(),
+        });
+        let text_response: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text_response, response);
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["response"], response);
+        assert_eq!(
+            response_text(&json!({"success": false, "error": "ordinary error"})),
+            Some("ordinary error".into())
+        );
     }
 
     #[test]

@@ -7,6 +7,8 @@ use super::cdp::types::*;
 
 #[derive(Debug, Clone)]
 pub struct RefEntry {
+    /// AX state used by act; not included in ordinary snapshot output.
+    pub act_state: serde_json::Value,
     pub backend_node_id: Option<i64>,
     pub role: String,
     pub name: String,
@@ -61,6 +63,7 @@ impl RefMap {
         self.map.insert(
             ref_id,
             RefEntry {
+                act_state: serde_json::Value::Null,
                 backend_node_id,
                 role: role.to_string(),
                 name: name.to_string(),
@@ -82,6 +85,7 @@ impl RefMap {
         self.map.insert(
             ref_id,
             RefEntry {
+                act_state: serde_json::Value::Null,
                 backend_node_id: None,
                 role: role.to_string(),
                 name: name.to_string(),
@@ -94,6 +98,12 @@ impl RefMap {
 
     pub fn get(&self, ref_id: &str) -> Option<&RefEntry> {
         self.map.get(ref_id)
+    }
+
+    pub fn set_act_state(&mut self, ref_id: &str, value: serde_json::Value) {
+        if let Some(entry) = self.map.get_mut(ref_id) {
+            entry.act_state = value;
+        }
     }
 
     pub fn entries_sorted(&self) -> Vec<(String, RefEntry)> {

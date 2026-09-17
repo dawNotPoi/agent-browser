@@ -1,3 +1,4 @@
+mod act;
 mod ca_bundle;
 mod chat;
 mod color;
@@ -2062,6 +2063,20 @@ fn main() {
         }
     }
 
+    // act owns its inference loop in this process. Browser setup above is the
+    // same as ordinary commands; each inner action still goes through the parser.
+    if cmd.get("action").and_then(|v| v.as_str()) == Some("act") {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        let result = rt.block_on(act::run_cli(&cmd, &flags));
+        let response: Response = serde_json::from_value(result).expect("act response envelope");
+        let success = response.success;
+        print_response_with_opts(&response, Some("act"), &OutputOptions::from_flags(&flags));
+        if !success {
+            exit(1);
+        }
+        return;
+    }
+
     // Handle batch command: from args or stdin
     if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
         let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2128,6 +2143,14 @@ fn send_command_with_respawn(
         },
         other => other,
     }
+}
+
+/// Common command preparation for batch and delegated act execution.
+fn prepare_browser_command(command: &mut serde_json::Value, flags: &Flags) {
+    attach_input_mode(command, flags);
+    attach_plugins_to_command(command, &flags.plugins);
+    attach_restore_config_to_command(command, flags);
+    attach_pin_tab_to_command(command, flags);
 }
 
 fn run_batch(
@@ -2215,16 +2238,12 @@ fn run_batch(
                 continue;
             }
         };
-        attach_input_mode(&mut parsed, flags);
+        prepare_browser_command(&mut parsed, flags);
 
         let action = parsed
             .get("action")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        attach_plugins_to_command(&mut parsed, &flags.plugins);
-        attach_restore_config_to_command(&mut parsed, flags);
-
-        attach_pin_tab_to_command(&mut parsed, flags);
 
         match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
             Ok(resp) => {

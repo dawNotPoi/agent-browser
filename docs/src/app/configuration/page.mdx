@@ -319,8 +319,8 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_COLOR</code></td><td>Enable colored CLI output when truthy.</td><td>(disabled)</td></tr>
     <tr><td><code>NO_COLOR</code></td><td>Disable colored output when present.</td><td>(not set)</td></tr>
     <tr><td><code>AI_GATEWAY_URL</code></td><td>Vercel AI Gateway base URL.</td><td><code>https://ai-gateway.vercel.sh</code></td></tr>
-    <tr><td><code>AI_GATEWAY_API_KEY</code></td><td>API key for the Vercel AI Gateway. Required to enable AI chat.</td><td>(none)</td></tr>
-    <tr><td><code>AI_GATEWAY_MODEL</code></td><td>Default AI model for dashboard chat.</td><td><code>anthropic/claude-sonnet-4.6</code></td></tr>
+    <tr><td><code>AI_GATEWAY_API_KEY</code></td><td>Vercel AI Gateway key for chat and experimental act. Act requires access to the typesafe-ai provider.</td><td>(none)</td></tr>
+    <tr><td><code>AI_GATEWAY_MODEL</code></td><td>Model override for chat and act. Act requires an evaluation model; use its --model flag when this selects a chat model.</td><td>Chat: <code>anthropic/claude-sonnet-4.6</code>; act: <code>typesafe-ai/jev</code></td></tr>
   </tbody>
 </table>
 

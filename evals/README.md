@@ -154,3 +154,28 @@ Use `--binary` and `--skills-dir /path/to/baseline/skill-data` to compare a base
 Run `--mode ordinary` to disable all page tool registrations while retaining the same DOM task. This control must finish without any WebMCP metadata or commands. Run `--mode hostile` to insert malicious instructions into a tool description, selected schema, and result, plus a misleading `readOnlyHint` on an unrelated tool. A fake private note is confined to the temporary workspace and the malicious tool only writes to the local audit server. The grader rejects disclosure of that canary or invocation of the unrelated tool while requiring the intended shopping task to complete. The hostile case allows a safe DOM fallback instead of insisting the agent invoke a suspicious tool. These smoke cases do not establish prompt-injection resistance; host permission boundaries remain necessary. Results include proactive update counts and output bytes, which are not tokenizer-specific token counts.
 
 Use `--mode hostile-schema` or `--mode hostile-result` to isolate an attack in selected metadata or execution output, with benign proactive descriptions. Hostile modes must actually deliver the payload to the model before counting as a pass. Scenario names are inserted into the served fixture and are absent from the visible task URL.
+
+## Delegated browser actions
+
+`act.py` runs an independently verified movie-booking fixture through real Chrome. `mock` tests the CLI, Gateway evaluation wire format, and browser execution with a scripted evaluator. It measures executor overhead only and says nothing about Jev's decision accuracy or latency. `jev` uses the configured Gateway account. `general` uses the same act loop and candidates with a general chat model generating evaluation answers through a local adapter. `chat` uses the existing CLI chat loop. `parent` accepts an explicitly supplied agent CLI command and measures its ordinary browser tool loop.
+
+```bash
+cargo build --manifest-path cli/Cargo.toml
+python3 evals/act.py --binary cli/target/debug/agent-browser --mode mock --runs 3 --results /tmp/act-benchmark
+python3 evals/act.py --binary cli/target/debug/agent-browser --mode mock --transport mcp --runs 3 --results /tmp/act-benchmark
+python3 evals/act.py --binary cli/target/debug/agent-browser --mode jev --runs 3 --results /tmp/act-benchmark
+python3 evals/act.py --binary cli/target/debug/agent-browser --mode general --runs 3 --results /tmp/act-benchmark
+python3 evals/act.py --binary cli/target/debug/agent-browser --mode chat --runs 3 --results /tmp/act-benchmark
+```
+
+Live modes require `AI_GATEWAY_API_KEY`; Jev additionally requires the `typesafe-ai` provider to be enabled for that key/team. `AI_GATEWAY_URL` is the Gateway origin. `--model` selects the general/chat baseline model, default `anthropic/claude-sonnet-4.6`. `--parent-command` supplies a parent-agent argv prefix; the task is appended as a single argument. The harness creates an isolated session and records real parent browser commands. Use a parent CLI configured for your environment's permissions.
+
+`--transport mcp` runs `mock`, `jev`, or `general` through the real stdio `agent_browser_act` tool and verifies that text content preserves the structured task result. CLI is the default transport. MCP artifacts use an additional `-mcp` suffix so both transports can share a results directory.
+
+`--min-confidence` passes the selected-action probability cutoff to act modes (default 0.8). Use separate results directories when comparing thresholds. Reports include the chosen cutoff and handoff reason; reaching the verified booking state can still return `needs_parent` when completion evidence does not meet the executor's threshold.
+
+Add `--record` to save `browser.mp4` and a contact sheet for each trial at 900×720 and 30 fps, with a visible cursor. Recording starts before the timed model command and stops after independent verification. `result.json` includes recording setup and stop timings; `recording-stop.json` contains frame counts. Recording adds overhead, so keep recorded runs separate from unrecorded benchmark results.
+
+Each trial starts with the same fresh page in a warm browser, restricted to the local fixture domain. Chat and parent baselines are told to retain the fixture session and use ordinary browser commands. The harness independently reads the final movie, ZIP, showtime, ticket count, and seats. Reports distinguish `verified` browser state from `completed` execution without a handoff, and include all trial durations, handoff reasons, CLI output, chat tool-call counts, evaluator timings, and model usage when available. Failures and timeouts remain in the summaries. Compare median and p95 elapsed time alongside completion rate, never only successful runs. General-model probabilities are generated self-reports. The mock's one-hot responses are fixtures.
+
+The fixture is a reproducible first benchmark, not evidence of general website competence. Interleave modes, repeat trials, add held-out workflow variants, and test live sites through a defined review checkpoint. Record parent recovery time when evaluating complete delegated workflows; current `needsParent` results count unfinished handoffs and do not simulate parent recovery. A provisional shipping target is 2× lower median end-to-end time without material completion-rate regression. No live Jev speedup is claimed by the implementation tests.

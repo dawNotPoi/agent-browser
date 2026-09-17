@@ -510,6 +510,29 @@ pub async fn take_snapshot(
 
     for (idx, nth) in &nodes_with_refs {
         let node = &tree_nodes[*idx];
+        let editable = ax_tree.nodes[*idx]
+            .properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.iter().any(|property| {
+                    property.name == "editable"
+                        && property
+                            .value
+                            .value
+                            .as_ref()
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value != "false")
+                })
+            });
+        let focused = ax_tree.nodes[*idx]
+            .properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.iter().any(|property| {
+                    property.name == "focused"
+                        && property.value.value.as_ref().and_then(Value::as_bool) == Some(true)
+                })
+            });
         let key = format!("{}:{}", node.role, node.name);
         let actual_nth = if duplicates.contains_key(&key) {
             Some(*nth)
@@ -542,6 +565,49 @@ pub async fn take_snapshot(
             &tree_nodes[*idx].name,
             actual_nth,
             frame_id,
+        );
+
+        // Reuse the AX tree already fetched for the snapshot rather than
+        // querying every form control and dropdown option separately.
+        let node = &tree_nodes[*idx];
+        let mut options = Vec::new();
+        let mut native_select = false;
+        if node.role == "combobox" || node.role == "listbox" {
+            collect_act_options(&tree_nodes, *idx, &mut options);
+            // ARIA dropdowns expose options too, but only an HTML select can
+            // use the select command. Custom menus use their observed buttons.
+            if let Some(backend_node_id) = node.backend_node_id {
+                if let Ok(described) = client
+                    .send_command(
+                        "DOM.describeNode",
+                        Some(serde_json::json!({"backendNodeId":backend_node_id,"depth":0})),
+                        Some(session_id),
+                    )
+                    .await
+                {
+                    native_select = described["node"]["nodeName"] == "SELECT";
+                }
+            }
+        }
+        let clickable_child = node.role == "option"
+            && node.children.iter().any(|&child| {
+                tree_nodes[child].role == "button" && tree_nodes[child].name == node.name
+            });
+        ref_map.set_act_state(
+            &ref_id,
+            serde_json::json!({
+                "value": node.value_text,
+                "editable": editable,
+                "focused": focused,
+                "disabled": node.disabled.unwrap_or(false),
+                "checked": node.checked,
+                "selected": node.selected.unwrap_or(false),
+                "expanded": node.expanded,
+                "nativeSelect": native_select,
+                "clickableChild": clickable_child,
+                "options": options,
+                "frameId": frame_id,
+            }),
         );
 
         tree_nodes[*idx].has_ref = true;
@@ -1212,6 +1278,21 @@ fn build_tree(nodes: &[AXNode]) -> (Vec<TreeNode>, Vec<usize>) {
     }
 
     (tree_nodes, root_indices)
+}
+
+fn collect_act_options(nodes: &[TreeNode], idx: usize, options: &mut Vec<Value>) {
+    for &child in &nodes[idx].children {
+        let node = &nodes[child];
+        if node.role == "option" {
+            options.push(serde_json::json!({
+                "label": node.name,
+                "disabled": node.disabled.unwrap_or(false),
+                "selected": node.selected.unwrap_or(false),
+            }));
+        } else {
+            collect_act_options(nodes, child, options);
+        }
+    }
 }
 
 fn render_tree(

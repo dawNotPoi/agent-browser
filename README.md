@@ -155,6 +155,7 @@ agent-browser close                   # Close browser (aliases: quit, exit)
 agent-browser close --all             # Close all active sessions
 agent-browser chat "<instruction>"    # AI chat: natural language browser control (single-shot)
 agent-browser chat                    # AI chat: interactive REPL mode
+agent-browser act "<goal>" --json      # Experimental multi-step execution with Jev
 ```
 
 ### WebMCP (experimental)
@@ -1086,7 +1087,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--input-mode <mode>` | Session pointer movement: `instant` (default), `smooth`, or `human` |
 | `--idle-timeout <time>` | Shut down the daemon after inactivity (`10s`, `3m`, `1h`, or raw ms). Defaults to `1h`; use `0` to disable (or `AGENT_BROWSER_IDLE_TIMEOUT_MS` env) |
 | `--no-auto-dialog` | Disable automatic dismissal of `alert`/`beforeunload` dialogs (or `AGENT_BROWSER_NO_AUTO_DIALOG` env) |
-| `--model <name>` | AI model for chat command (or `AI_GATEWAY_MODEL` env) |
+| `--model <name>` | AI model for chat or act (or `AI_GATEWAY_MODEL` env); act requires an evaluation model |
 | `-v`, `--verbose` | Show tool commands and their raw output (chat) |
 | `-q`, `--quiet` | Show only AI text responses, hide tool calls (chat) |
 | `--config <path>` | Use a custom config file (or `AGENT_BROWSER_CONFIG` env) |
@@ -1132,6 +1133,39 @@ The dashboard displays:
 - **Console output**: browser console messages (log, warn, error)
 - **Session creation**: create new sessions from the UI with local engines (Chrome, Lightpanda) or cloud providers (AgentCore, Browserbase, Browserless, Browser Use, Kernel)
 - **AI Chat**: chat with an AI assistant directly in the dashboard (requires Vercel AI Gateway configuration)
+
+### Delegated browser actions (experimental)
+
+`act` lets a parent agent delegate several browser steps in one command. The Rust CLI observes the current page, gives Jev a choice of concrete browser actions, executes the selected action through the normal daemon, and repeats until the goal is complete or the parent is needed. It uses `typesafe-ai/jev` through Vercel AI Gateway's evaluation API. Set `AI_GATEWAY_API_KEY` with access to the `typesafe-ai` provider; a Gateway HTTP 403 can mean the team/key restricts that provider. `AI_GATEWAY_URL` is the Gateway origin and defaults to `https://ai-gateway.vercel.sh`.
+
+```bash
+agent-browser --session movies --model typesafe-ai/jev act \
+  "Find two adult tickets for the requested movie tomorrow after 7pm. Choose adjacent seats and stop at order review." \
+  --url https://www.fandango.com --input @booking.json --json
+```
+
+For example, `booking.json` could contain `{"movie":"Arrival","zip":"60611","count":2}`. Resolve the user's movie, location, date, and other preferences before delegating. Without `--url`, act uses the active page. It chooses from real refs and supplied values; it does not generate arbitrary text or interpret screenshots/canvas. A visual seat map may require the parent to intervene.
+
+| Act option | Meaning |
+|------------|---------|
+| `--url <url>` | Optional initial HTTP(S) navigation |
+| `--input <json\|@file>` | Up to 32 named string, number, or boolean values; at most 64 KiB JSON |
+| `--max-steps <n>` | Maximum browser actions, including initial navigation; default 30, maximum 1000 |
+| `--timeout <ms>` | Task budget; default 120000, maximum 3600000 |
+| `--min-confidence <0..1>` | Minimum selected-action probability; default 0.8 |
+| `--model <name>` | Evaluation model; default `typesafe-ai/jev`, overridden by `AI_GATEWAY_MODEL`, config `model`, or this flag |
+
+Chat models cannot serve the evaluation endpoint. Use `--model typesafe-ai/jev` when your environment or config selects a chat model. The model receives the goal, supplied input, page content, and recent action results. Browser domain restrictions and action policies remain in effect; the Gateway request is separate from browser traffic. Page content remains untrusted.
+
+JSON returns `data.status` as `completed`, `needs_parent`, `limit_reached`, `cancelled`, or `error`, plus `data.reason`, `data.observation`, `data.steps`, `data.usage`, and `data.metrics` (elapsed, decision, and browser milliseconds; decisions and actions). Exit status is 0 only for `completed`; all other outcomes exit 1 with partial progress. Text output respects content boundaries and output limits. The browser stays open. The parent can use ordinary commands and call act again in the same session with the remaining goal and input.
+
+Action choices are paginated within Jev's 255-choice limit. Observations are limited to 128 KiB. Four unchanged observations or a decision budget of `3 * maxSteps + 20` end the loop. Before dispatch, the daemon verifies that the page still matches the observation. Completion requires both a selected completion action and a completion probability of at least 0.95, followed by a fresh matching observation. These probabilities and thresholds are heuristics, not accuracy guarantees. Confirmation requests return to the parent, including with `--confirm-interactive`; act does not approve them. Ctrl+C and task timeout stop new steps, but an in-flight browser command may still finish. Inspect the page before retrying an action marked with an unknown outcome.
+
+The default MCP `core` profile includes `agent_browser_act`, with typed `goal`, `url`, `input`, `maxSteps`, `taskTimeoutMs`, `minConfidence`, and `model` fields. CLI and MCP share the parser and result schema. MCP's outer timeout defaults to the task budget plus 30 seconds; an explicit `timeoutMs` can stop the CLI sooner and may omit its final partial result. Snapshot observation and guard metadata are private transport details of act, not separate public commands or tools.
+
+Model requests omit duplicate ref metadata and command results while retaining page text and control values. Full observations remain available to the parent and stale-action guard. Custom dropdowns use observed clickable options; only HTML select elements use the select command.
+
+See [the act benchmark](evals/README.md#delegated-browser-actions) for repeatable Chrome booking trials. Measure end-to-end completion time and parent interventions for your tasks; results from individual live-site demonstrations do not establish a general speedup.
 
 ### AI Chat
 

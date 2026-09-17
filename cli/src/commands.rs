@@ -175,6 +175,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "plugin"
             | "plugins"
             | "chat"
+            | "act"
             | "webmcp"
     )
 }
@@ -378,6 +379,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
     }
 
     match cmd {
+        "act" => crate::act::parse(&rest, flags, &id),
         // === Navigation ===
         // Maps to "navigate" action in protocol; reflected in ACTION_CATEGORIES in action-policy.ts
         "open" | "goto" | "navigate" => {
