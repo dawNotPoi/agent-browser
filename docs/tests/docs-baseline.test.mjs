@@ -42,7 +42,7 @@ test("deployment explicitly uses Corepack for frozen installs and builds", async
   );
   assert.equal(
     config.installCommand,
-    "corepack pnpm install --frozen-lockfile",
+    "corepack pnpm --filter docs install --frozen-lockfile",
   );
   assert.equal(config.buildCommand, "corepack pnpm run build");
 });
