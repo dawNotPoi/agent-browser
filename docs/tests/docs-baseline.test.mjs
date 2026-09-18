@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, readdir } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
 import { test } from "node:test";
 import { navigation } from "../src/lib/docs-navigation.ts";
 import {
@@ -13,6 +13,28 @@ import {
   assertOriginalResource,
   assertUntrackedHtml,
 } from "./helpers.mjs";
+
+test("deployment pins the same pnpm version as the workspace", async () => {
+  const [workspace, docs] = await Promise.all([
+    readFile(new URL("../../package.json", import.meta.url), "utf8").then(
+      JSON.parse,
+    ),
+    readFile(new URL("../package.json", import.meta.url), "utf8").then(
+      JSON.parse,
+    ),
+  ]);
+  assert.match(workspace.packageManager, /^pnpm@\d+\.\d+\.\d+$/);
+  assert.equal(docs.packageManager, workspace.packageManager);
+});
+
+test("deployment uses the workspace lockfile without a stale docs override", async () => {
+  await access(new URL("../../pnpm-lock.yaml", import.meta.url));
+  await assert.rejects(
+    access(new URL("../pnpm-lock.yaml", import.meta.url)),
+    { code: "ENOENT" },
+    "A docs-local lockfile shadows the workspace lockfile during deployment",
+  );
+});
 
 test("baseline pins all 38 routes and the original metadata, slugger and converter sources", () => {
   assert.equal(baseline.commit, "aff6125c023b810ea3f2e5deec5379e9a4270bdc");
