@@ -35,6 +35,8 @@ In the `docs/content/docs/` MDX files, always use HTML `<table>` syntax for tabl
 
 For documentation changes, run `pnpm --filter docs test`, `pnpm --filter docs type-check`, `pnpm --filter docs build`, and `pnpm --filter docs test:routes`. The route suite starts its own production server. Its frozen migration fixtures cover the original public routes, metadata, content, anchors, and API contracts; only update affected fixtures when deliberately changing that contract.
 
+The Vercel docs project uses `docs` as its Root Directory and must enable **Include source files outside of the Root Directory in the Build Step** (`sourceFilesOutsideRootDirectory`). Installation requires the repository's `pnpm-workspace.yaml`, root `pnpm-lock.yaml`, and `patches/`. Keep the docs `packageManager` pin aligned with the root and use the Corepack commands in `docs/vercel.json`; do not create a separate docs lockfile or disable frozen installs.
+
 ## Dashboard (packages/dashboard)
 
 - Never use native browser dialogs (`alert`, `confirm`, `prompt`). Use shadcn/ui components (`Dialog`, `AlertDialog`, etc.) instead.
