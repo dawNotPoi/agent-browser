@@ -36,6 +36,17 @@ test("deployment uses the workspace lockfile without a stale docs override", asy
   );
 });
 
+test("deployment explicitly uses Corepack for frozen installs and builds", async () => {
+  const config = JSON.parse(
+    await readFile(new URL("../vercel.json", import.meta.url), "utf8"),
+  );
+  assert.equal(
+    config.installCommand,
+    "corepack pnpm install --frozen-lockfile",
+  );
+  assert.equal(config.buildCommand, "corepack pnpm run build");
+});
+
 test("baseline pins all 38 routes and the original metadata, slugger and converter sources", () => {
   assert.equal(baseline.commit, "aff6125c023b810ea3f2e5deec5379e9a4270bdc");
   assert.equal(pages.length, 38);
