@@ -1,6 +1,8 @@
 #[cfg(windows)]
 use super::windows_process::Child;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
@@ -1559,14 +1561,44 @@ fn should_disable_sandbox(existing_args: &[String]) -> bool {
     false
 }
 
-/// Returns true if Chrome should use disk instead of /dev/shm for shared memory.
-/// On CI runners and containers, /dev/shm is often too small (64MB default),
-/// which causes Chrome to crash mid-session.
+#[cfg(any(target_os = "linux", test))]
+const MIN_DEV_SHM_AVAILABLE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+fn available_filesystem_bytes(path: &Path) -> Option<u64> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+
+    // SAFETY: `path` is a valid, NUL-terminated C string and `stats` points to
+    // writable storage for a `statvfs` value. A successful call initializes it.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+
+    let stats = unsafe { stats.assume_init() };
+    let available_bytes = u128::from(stats.f_bavail).saturating_mul(u128::from(stats.f_frsize));
+    Some(u64::try_from(available_bytes).unwrap_or(u64::MAX))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn dev_shm_is_too_small(available_bytes: u64) -> bool {
+    available_bytes < MIN_DEV_SHM_AVAILABLE_BYTES
+}
+
+/// Returns true if Chrome should use disk instead of `/dev/shm` for shared memory.
+/// Prefer the actual filesystem capacity over environment markers because some
+/// container runtimes expose no conventional marker and others provision a large mount.
 fn should_disable_dev_shm(existing_args: &[String]) -> bool {
     if existing_args.iter().any(|a| a == "--disable-dev-shm-usage") {
         return false;
     }
 
+    #[cfg(target_os = "linux")]
+    if let Some(available_bytes) = available_filesystem_bytes(Path::new("/dev/shm")) {
+        return dev_shm_is_too_small(available_bytes);
+    }
+
+    // Preserve the existing safe fallback when `/dev/shm` cannot be inspected.
     if std::env::var("CI").is_ok() {
         return true;
     }
@@ -1743,6 +1775,21 @@ fn expand_tilde(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
+
+    #[test]
+    fn test_dev_shm_capacity_threshold() {
+        assert!(dev_shm_is_too_small(64 * 1024 * 1024));
+        assert!(dev_shm_is_too_small(128 * 1024 * 1024));
+        assert!(!dev_shm_is_too_small(256 * 1024 * 1024));
+        assert!(!dev_shm_is_too_small(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_existing_disable_dev_shm_arg_is_not_duplicated() {
+        assert!(!should_disable_dev_shm(&[
+            "--disable-dev-shm-usage".to_string()
+        ]));
+    }
 
     fn prepared_nss_home() -> PreparedNssHome {
         let path = std::env::temp_dir().join(format!(
