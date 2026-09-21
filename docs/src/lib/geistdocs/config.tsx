@@ -14,6 +14,7 @@ export const config = defineConfig({
     </span>
   ),
   navbarActiveProduct: "agent-browser",
+  navbarBrand: "labs",
   github: {
     owner: "vercel-labs",
     repo: "agent-browser",
