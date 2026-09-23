@@ -607,6 +607,27 @@ test("WebMCP search results use Features without changing the public URL", async
   assert.ok(!nativeMatches[0].breadcrumbs.includes("Reference"));
 });
 
+for (const page of pages.filter(
+  (page) =>
+    ["Providers", "Engines"].includes(page.navigation.section) ||
+    page.path === "/changelog",
+)) {
+  test(`native search preserves original section breadcrumbs for ${page.path}`, async () => {
+    const response = await get(
+      `/api/search?query=${encodeURIComponent(page.navigation.title)}&locale=en`,
+    );
+    responseType(response, "application/json");
+    const matches = (await response.json()).filter(
+      (result) => result.type === "page" && result.url === page.path,
+    );
+    assert.equal(matches.length, 1);
+    assert.deepEqual(
+      matches[0].breadcrumbs,
+      ["Docs", page.navigation.section].filter(Boolean),
+    );
+  });
+}
+
 for (const probe of [
   {
     query: "restoreCheckFn",

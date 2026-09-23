@@ -31,8 +31,11 @@
     "next",
     "eve",
     "native-mode",
-    "providers",
-    "engines",
+    "---Providers---",
+    "...providers",
+    "---Engines---",
+    "...engines",
+    "---",
     "changelog"
   ]
 }

@@ -130,7 +130,7 @@ test("WebMCP appears once in Features after CDP Mode in both navigation sources"
   assert.deepEqual(
     meta.pages.slice(
       meta.pages.indexOf("---Features---") + 1,
-      meta.pages.indexOf("providers"),
+      meta.pages.indexOf("---Providers---"),
     ),
     featurePaths.map((href) => href.slice(1)),
   );
